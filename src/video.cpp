@@ -1891,6 +1891,13 @@ namespace video {
     // Use client-specified display_name if provided, otherwise use the selected display
     std::string target_display_name;
     auto config = capture_ctxs.front().config;
+
+    // Plan4: track the per-session window-follow override generation so the
+    // capture backend is reinitialized when a control client switches the
+    // capture target for this session.
+    std::uint64_t last_override_generation =
+      config.capture_target ? config.capture_target->window_override_generation() : 0;
+
     if (!config.display_name.empty()) {
       // config.display_name may be a device ID (e.g., {xxx-xxx-xxx}) rather than display name (e.g., \\.\DISPLAY1)
       // Try to convert device ID to display name first
@@ -2060,6 +2067,18 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
+      // Plan4: react to window-follow override changes between capture
+      // iterations as well; WGC may idle on static content and the push
+      // callback is not guaranteed to run promptly after an override change.
+      if (!capture_ctxs.empty()) {
+        const auto &front_config = capture_ctxs.front().config;
+        const auto override_generation =
+          front_config.capture_target ? front_config.capture_target->window_override_generation() : 0;
+        if (override_generation != last_override_generation) {
+          artificial_reinit = true;
+        }
+      }
+
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
@@ -2077,6 +2096,19 @@ namespace video {
         if (force_system_capture.load(std::memory_order_acquire)) {
           artificial_reinit = true;
           return false;
+        }
+
+        // Plan4: a local control client changed the window-follow override for
+        // this session; rebuild the display backend with the new target.
+        if (!capture_ctxs.empty()) {
+          const auto &front_config = capture_ctxs.front().config;
+          const auto override_generation =
+            front_config.capture_target ? front_config.capture_target->window_override_generation() : 0;
+          if (override_generation != last_override_generation) {
+            last_override_generation = override_generation;
+            artificial_reinit = true;
+            return false;
+          }
         }
 
         // 先接入新会话，再分发本次真实画面。若本次只是捕获超时，则给新会话
@@ -2206,6 +2238,10 @@ namespace video {
                 publish_capture_target(capture_ctx.config, *disp);
               }
               active_display_event->raise(target_display_name);
+              if (!capture_ctxs.empty() && capture_ctxs.front().config.capture_target) {
+                last_override_generation =
+                  capture_ctxs.front().config.capture_target->window_override_generation();
+              }
               break;
             }
           }
@@ -4302,8 +4338,10 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    // Cache window capture mode check outside the loop
-    const bool is_window_capture = (config::video.capture_target == "window");
+    // Cache window capture mode check outside the loop. A per-session
+    // window-follow override counts as window capture for orientation logic.
+    const bool is_window_capture = (config::video.capture_target == "window") ||
+      (config.capture_target && config.capture_target->window_override_enabled());
     const bool is_pyrowave = config.videoFormat == static_cast<int>(LI_PYROWAVE_VIDEO_FORMAT);
 #ifdef _WIN32
     bool pyrowave_gpu_disabled = false;

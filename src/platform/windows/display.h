@@ -25,6 +25,7 @@
 #include <AMF/core/CurrentTime.h>
 
 #include "src/platform/common.h"
+#include "src/streaming/capture_target.h"
 #include "src/streaming/frame_rate_tracker.h"
 #include "src/platform/windows/frame_contract.h"
 #include "src/utility.h"
@@ -564,6 +565,27 @@ namespace platf::dxgi {
      */
     bool
     is_window_valid() const;
+
+    // ---- Plan4: per-session window-follow capture -------------------------
+    // Copied from video::config_t::capture_target at init(). The override is
+    // session-scoped: only the session that owns this display object can
+    // request it, and the global Sunshine capture settings are untouched.
+    streaming::window_capture_override_t window_override;
+    bool window_override_active { false };
+    std::shared_ptr<streaming::capture_target_t> capture_target_handle;
+    std::chrono::steady_clock::time_point override_poll_time {};
+    std::chrono::steady_clock::time_point override_last_switch {};
+
+    /**
+     * @brief Poll the active window-follow override.
+     *
+     * Returns @ref capture_e::reinit when the capture target changed and the
+     * capture thread must rebuild the display backend (new window target, or a
+     * window became available after a display-capture fallback). Returns
+     * @ref capture_e::ok otherwise.
+     */
+    capture_e
+    poll_window_override();
   };
 
   /**
