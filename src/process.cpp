@@ -313,6 +313,10 @@ namespace proc {
       }
     }
 
+    // Reset before launching so Desktop apps or a failed start never leave a
+    // stale PID around for the window-follow candidate filter.
+    _app_pid = 0;
+
     if (_app.cmd.empty()) {
       BOOST_LOG(info) << "Executing [Desktop]"sv;
       placebo = true;
@@ -327,6 +331,7 @@ namespace proc {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
         return -1;
       }
+      _app_pid = static_cast<std::uint32_t>(_process.id());
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
@@ -383,6 +388,7 @@ namespace proc {
     terminate_process_group(_process, _process_group, _app.exit_timeout);
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();
+    _app_pid = 0;
 
     for (; _app_prep_it != _app_prep_begin; --_app_prep_it) {
       auto &cmd = *(_app_prep_it - 1);
@@ -519,6 +525,11 @@ namespace proc {
   std::string
   proc_t::get_last_run_app_name() {
     return _app.name;
+  }
+
+  std::uint32_t
+  proc_t::get_app_pid() {
+    return _app_pid;
   }
 
   std::optional<rtsp_stream::synthetic_hdr_config_t>

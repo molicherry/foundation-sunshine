@@ -5,6 +5,7 @@
 // platform includes
 #include <winsock2.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -539,17 +540,139 @@ namespace platf::dxgi {
   }
 
   /**
+   * @brief Plan4: creation time of @p process_id in Unix-epoch milliseconds,
+   *        or 0 when it cannot be queried (process gone / access denied).
+   */
+  static std::int64_t
+  process_start_unix_ms(DWORD process_id) {
+    if (process_id == 0) {
+      return 0;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) {
+      return 0;
+    }
+
+    FILETIME creation {}, exit {}, kernel {}, user {};
+    std::int64_t result = 0;
+    if (GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+      ULARGE_INTEGER ticks {};
+      ticks.LowPart = creation.dwLowDateTime;
+      ticks.HighPart = creation.dwHighDateTime;
+      // FILETIME counts 100ns intervals since 1601-01-01 UTC.
+      constexpr std::uint64_t unix_epoch_offset_100ns = 116444736000000000ULL;
+      if (ticks.QuadPart > unix_epoch_offset_100ns) {
+        result = static_cast<std::int64_t>((ticks.QuadPart - unix_epoch_offset_100ns) / 10000ULL);
+      }
+    }
+
+    CloseHandle(process);
+    return result;
+  }
+
+  /**
+   * @brief Plan4: true when @p process_id is a descendant of @p root_process_id.
+   */
+  static bool
+  is_process_descendant_of(DWORD root_process_id, DWORD process_id) {
+    if (root_process_id == 0 || process_id == 0 || root_process_id == process_id) {
+      return false;
+    }
+
+    std::vector<std::pair<DWORD, DWORD>> pid_to_parent;  // pid -> parent pid
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+      do {
+        pid_to_parent.emplace_back(
+          static_cast<DWORD>(entry.th32ProcessID),
+          static_cast<DWORD>(entry.th32ParentProcessID));
+      } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+
+    auto find_parent = [&pid_to_parent](DWORD pid) -> DWORD {
+      for (const auto &pair : pid_to_parent) {
+        if (pair.first == pid) {
+          return pair.second;
+        }
+      }
+      return 0;
+    };
+
+    DWORD current = process_id;
+    for (int guard = 0; guard < 64; ++guard) {
+      const DWORD parent = find_parent(current);
+      if (parent == 0) {
+        return false;
+      }
+      if (parent == root_process_id) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
+  /**
+   * @brief Plan4: foreground candidates for window-follow mode.
+   *
+   * Only the Sunshine-launched application process tree, plus processes started
+   * around/after the override was enabled, may be followed. This keeps a
+   * game-exit transient (desktop, browser, launcher or any unrelated app that
+   * grabs foreground) from being streamed to the client.
+   */
+  static HWND
+  find_override_foreground_window(std::uint32_t root_process_id, std::int64_t enabled_at_unix_ms) {
+    HWND candidate = find_eligible_foreground_window();
+    if (!candidate) {
+      return nullptr;
+    }
+
+    DWORD candidate_pid = 0;
+    GetWindowThreadProcessId(candidate, &candidate_pid);
+    if (candidate_pid == 0) {
+      return nullptr;
+    }
+
+    if (root_process_id != 0 &&
+        (candidate_pid == root_process_id || is_process_descendant_of(root_process_id, candidate_pid))) {
+      return candidate;
+    }
+
+    if (enabled_at_unix_ms > 0) {
+      const auto started_at = process_start_unix_ms(candidate_pid);
+      // 10 seconds of slack: the game may have started slightly before the
+      // control client's (delayed) enable request.
+      if (started_at != 0 && started_at + 10000 >= enabled_at_unix_ms) {
+        return candidate;
+      }
+    }
+
+    return nullptr;
+  }
+
+  /**
    * @brief Plan4: resolve the requested window-follow target.
    *
    * Returns nullptr when no eligible window is currently available; callers
    * fall back to display capture and retry later.
    */
   static HWND
-  resolve_window_override_target(const streaming::window_capture_override_t &override) {
+  resolve_window_override_target(
+    const streaming::window_capture_override_t &override,
+    std::uint32_t root_process_id,
+    std::int64_t enabled_at_unix_ms) {
     switch (override.mode) {
       case streaming::window_capture_mode_e::title: {
         if (override.window_title.empty()) {
-          return find_eligible_foreground_window();
+          return find_override_foreground_window(root_process_id, enabled_at_unix_ms);
         }
         HWND hwnd = find_window_by_title(override.window_title);
         return is_window_capture_eligible(hwnd) ? hwnd : nullptr;
@@ -558,7 +681,7 @@ namespace platf::dxgi {
         return find_window_for_process_id(override.process_id);
       case streaming::window_capture_mode_e::foreground:
       default:
-        return find_eligible_foreground_window();
+        return find_override_foreground_window(root_process_id, enabled_at_unix_ms);
     }
   }
 
@@ -659,6 +782,8 @@ namespace platf::dxgi {
                                            : streaming::window_capture_override_t {};
     window_override_active = window_override.enabled;
     capture_target_handle = config.capture_target;
+    override_root_pid = proc::proc.get_app_pid();
+    override_enabled_at_unix_ms = capture_target_handle ? capture_target_handle->window_override_enabled_at_unix_ms() : 0;
     override_poll_time = std::chrono::steady_clock::now();
     override_last_switch = std::chrono::steady_clock::time_point {};
 
@@ -734,7 +859,7 @@ namespace platf::dxgi {
         constexpr int override_retry_interval_ms = 250;
         HWND target_hwnd = nullptr;
         for (int retry = 0; retry < max_override_retries; ++retry) {
-          target_hwnd = resolve_window_override_target(window_override);
+          target_hwnd = resolve_window_override_target(window_override, override_root_pid, override_enabled_at_unix_ms);
           if (target_hwnd) {
             break;
           }
@@ -1075,7 +1200,7 @@ namespace platf::dxgi {
     }
     override_poll_time = now;
 
-    HWND desired = resolve_window_override_target(window_override);
+    HWND desired = resolve_window_override_target(window_override, override_root_pid, override_enabled_at_unix_ms);
 
     if (captured_window_hwnd != nullptr) {
       // Follow window changes only when a different, eligible window exists.

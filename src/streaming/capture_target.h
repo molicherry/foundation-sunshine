@@ -13,6 +13,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -109,6 +110,7 @@ namespace streaming {
     set_window_override(window_capture_override_t override) {
       std::lock_guard lock { mutex_ };
       window_override_ = std::move(override);
+      window_override_enabled_at_unix_ms_ = window_override_.enabled ? unix_time_ms_now() : 0;
       observed_ = {};
       window_override_generation_.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -153,11 +155,34 @@ namespace streaming {
       return observed_;
     }
 
+    /**
+     * @brief Unix-epoch milliseconds when the current window override was
+     *        enabled, or 0 when it is disabled.
+     *
+     * The Windows capture backend uses this as a lower bound when deciding
+     * which foreground windows may be followed: the Sunshine-launched app
+     * process tree plus processes started around/after this moment. This keeps
+     * a game-exit transient from switching the stream to an unrelated app.
+     */
+    std::int64_t
+    window_override_enabled_at_unix_ms() const {
+      std::lock_guard lock { mutex_ };
+      return window_override_enabled_at_unix_ms_;
+    }
+
   private:
+    static std::int64_t
+    unix_time_ms_now() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+    }
+
     mutable std::mutex mutex_;
     std::string display_name_;
     window_capture_override_t window_override_;
     window_capture_observed_t observed_;
+    std::int64_t window_override_enabled_at_unix_ms_ { 0 };
     std::atomic<std::uint64_t> window_override_generation_ { 0 };
   };
 

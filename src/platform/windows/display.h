@@ -575,6 +575,10 @@ namespace platf::dxgi {
     std::shared_ptr<streaming::capture_target_t> capture_target_handle;
     std::chrono::steady_clock::time_point override_poll_time {};
     std::chrono::steady_clock::time_point override_last_switch {};
+    // Candidate filter (foreground mode): Sunshine-launched app process tree
+    // and processes started around/after the override was enabled.
+    std::uint32_t override_root_pid { 0 };
+    std::int64_t override_enabled_at_unix_ms { 0 };
 
     /**
      * @brief Poll the active window-follow override.

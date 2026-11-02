@@ -8,6 +8,7 @@
   #define __kernel_entry
 #endif
 
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
 
@@ -112,6 +113,17 @@ namespace proc {
     get_app_cmd(int app_id);
     std::string
     get_last_run_app_name();
+
+    /**
+     * @brief PID of the application process launched by Sunshine.
+     *
+     * Returns 0 for the Desktop app or when no tracked application process is
+     * running (for example detached/placebo apps). Used by the per-session
+     * window-follow capture to restrict foreground candidates to the launched
+     * application's process tree and to processes started for the game.
+     */
+    std::uint32_t
+    get_app_pid();
     std::optional<rtsp_stream::synthetic_hdr_config_t>
     get_app_rtx_hdr_config(int app_id) const;
     std::optional<rtsp_stream::dlssnr_config_t>
@@ -131,6 +143,9 @@ namespace proc {
 
   private:
     int _app_id;
+
+    // PID of the tracked app process; 0 when no process is tracked.
+    std::uint32_t _app_pid { 0 };
 
     std::string _apps_etag;
 
