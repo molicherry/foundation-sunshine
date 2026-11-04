@@ -61,6 +61,13 @@ extern "C" {
 using namespace std::literals;
 namespace video {
 
+  // Defined below; encode_run() re-publishes these when a captured window moves.
+  input::touch_port_t
+  make_port(platf::display_t *display, const config_t &config);
+
+  bool
+  touch_ports_equal(const input::touch_port_t &lhs, const input::touch_port_t &rhs);
+
   namespace {
     std::mutex hdr_pipeline_status_mutex;
     std::map<std::uint64_t, hdr_pipeline_status_t> hdr_pipeline_statuses;
@@ -1136,6 +1143,7 @@ namespace video {
     config_t config;
     int frame_nr;
     void *channel_data;
+    std::optional<input::touch_port_t> last_touch_port;
   };
 
   struct sync_session_t {
@@ -3652,6 +3660,9 @@ namespace video {
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto dynamic_param_events_ptr = dynamic_param_events.value_or(mail::man->event<dynamic_param_t>(mail::dynamic_param_change));
     auto input_activity_event = mail->event<std::chrono::steady_clock::time_point>(mail::input_activity);
+    auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+    auto last_touch_port = make_port(disp.get(), config);
+    touch_port_event->raise(last_touch_port);
     auto input_boost_until = std::chrono::steady_clock::time_point::min();
 
     auto consume_input_activity = [&]() {
@@ -3734,6 +3745,14 @@ namespace video {
       // the blank dummy frame just to let Moonlight know that we're alive.
       if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
         break;
+      }
+
+      // Window capture can move or change size without triggering a reinit.
+      // Re-publish absolute-input geometry when the captured window rectangle
+      // changed, and keep display capture on its existing monitor geometry.
+      if (const auto port = make_port(disp.get(), config); !touch_ports_equal(last_touch_port, port)) {
+        touch_port_event->raise(port);
+        last_touch_port = port;
       }
 
       bool requested_idr_frame = false;
@@ -3876,36 +3895,92 @@ namespace video {
   }
 
   input::touch_port_t
-  make_port(platf::display_t *display, const config_t &config) {
-    float wd = display->width;
-    float hd = display->height;
+  make_touch_port_for_rect(
+    const config_t &config,
+    int target_width,
+    int target_height,
+    int target_offset_x,
+    int target_offset_y,
+    int env_width,
+    int env_height) {
+    const float wd = static_cast<float>(target_width);
+    const float hd = static_cast<float>(target_height);
 
-    float wt = config.width;
-    float ht = config.height;
+    const float wt = static_cast<float>(config.width);
+    const float ht = static_cast<float>(config.height);
 
-    auto scalar = std::fminf(wt / wd, ht / hd);
+    const auto scalar = std::fminf(wt / wd, ht / hd);
 
-    auto w2 = scalar * wd;
-    auto h2 = scalar * hd;
+    const auto w2 = scalar * wd;
+    const auto h2 = scalar * hd;
 
-    auto offsetX = (config.width - w2) * 0.5f;
-    auto offsetY = (config.height - h2) * 0.5f;
+    const auto offsetX = (static_cast<float>(config.width) - w2) * 0.5f;
+    const auto offsetY = (static_cast<float>(config.height) - h2) * 0.5f;
 
     return input::touch_port_t {
       {
-        display->offset_x,
-        display->offset_y,
+        target_offset_x,
+        target_offset_y,
         config.width,
         config.height,
       },
-      display->env_width,
-      display->env_height,
-      display->width,
-      display->height,
+      env_width,
+      env_height,
+      target_width,
+      target_height,
       offsetX,
       offsetY,
       1.0f / scalar,
     };
+  }
+
+  bool
+  touch_ports_equal(const input::touch_port_t &lhs, const input::touch_port_t &rhs) {
+    return lhs.offset_x == rhs.offset_x &&
+           lhs.offset_y == rhs.offset_y &&
+           lhs.width == rhs.width &&
+           lhs.height == rhs.height &&
+           lhs.env_width == rhs.env_width &&
+           lhs.env_height == rhs.env_height &&
+           lhs.display_width == rhs.display_width &&
+           lhs.display_height == rhs.display_height &&
+           lhs.client_offsetX == rhs.client_offsetX &&
+           lhs.client_offsetY == rhs.client_offsetY &&
+           lhs.scalar_inv == rhs.scalar_inv;
+  }
+
+  input::touch_port_t
+  make_port(platf::display_t *display, const config_t &config) {
+    int target_width = display->width;
+    int target_height = display->height;
+    int target_offset_x = display->offset_x;
+    int target_offset_y = display->offset_y;
+    int env_width = display->env_width;
+    int env_height = display->env_height;
+
+#ifdef _WIN32
+    // Window capture has no fixed monitor: use the window's current
+    // virtual-screen rectangle so absolute mouse/touch/pen input stays aligned
+    // after the window moves, switches monitors, or changes size/DPI.
+    if (auto *dxgi_display = dynamic_cast<platf::dxgi::display_base_t *>(display);
+        dxgi_display && !dxgi_display->captures_monitor) {
+      std::lock_guard lock(dxgi_display->window_capture_rect_mutex);
+      if (dxgi_display->has_window_capture_rect) {
+        target_width = dxgi_display->window_capture_rect.width;
+        target_height = dxgi_display->window_capture_rect.height;
+        target_offset_x = dxgi_display->window_capture_rect.offset_x;
+        target_offset_y = dxgi_display->window_capture_rect.offset_y;
+        env_width = dxgi_display->env_width;
+        env_height = dxgi_display->env_height;
+      }
+    }
+#endif
+
+    return make_touch_port_for_rect(
+      config,
+      target_width, target_height,
+      target_offset_x, target_offset_y,
+      env_width, env_height);
   }
 
   /**
@@ -4154,6 +4229,17 @@ namespace video {
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+        // Refresh window-capture absolute-input geometry before encoding this
+        // frame. make_synced_session() seeds the port for new contexts; this
+        // path handles later window movement without a capture reinit.
+        for (auto &touch_ctx : synced_session_ctxs) {
+          const auto port = make_port(disp.get(), touch_ctx->config);
+          if (!touch_ctx->last_touch_port || !touch_ports_equal(*touch_ctx->last_touch_port, port)) {
+            touch_ctx->touch_port_events->raise(port);
+            touch_ctx->last_touch_port = port;
+          }
+        }
+
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
@@ -4352,10 +4438,20 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    // Cache window capture mode check outside the loop. A per-session
-    // window-follow override counts as window capture for orientation logic.
-    const bool is_window_capture = (config::video.capture_target == "window") ||
-      (config.capture_target && config.capture_target->window_override_enabled());
+    // The capture target can change across reinitializations (window-follow
+    // falls back to a display when no window exists, and later reattaches).
+    // Never cache this at startup: orientation and resolution handling must use
+    // the target actually opened by the current display object.
+    const auto display_is_window_capture = [&config](const platf::display_t *display) {
+#ifdef _WIN32
+      if (const auto *dxgi_display = dynamic_cast<const platf::dxgi::display_base_t *>(display)) {
+        return !dxgi_display->captures_monitor;
+      }
+#endif
+      // Preserve existing global window-capture semantics outside DXGI.
+      return config::video.capture_target == "window" ||
+        (config.capture_target && config.capture_target->window_override_enabled());
+    };
     const bool is_pyrowave = config.videoFormat == static_cast<int>(LI_PYROWAVE_VIDEO_FORMAT);
 #ifdef _WIN32
     bool pyrowave_gpu_disabled = false;
@@ -4367,6 +4463,12 @@ namespace video {
     // Track display dimensions for resolution change detection
     int last_display_width = 0;
     int last_display_height = 0;
+
+    // Track whether the previous reinit captured a window or a monitor. A
+    // window/display transition must re-evaluate orientation and resolution
+    // instead of inheriting the previous target's cached geometry.
+    bool last_target_was_window_capture = false;
+    bool have_last_target = false;
 
     // Track initial scale ratio (encoding resolution / display resolution)
     // Used to maintain consistent scaling when display resolution changes
@@ -4397,6 +4499,21 @@ namespace video {
       // For WGC window capture, display->width/height is monitor resolution, not window size
       const int current_width = display->width;
       const int current_height = display->height;
+
+      // Read the actual capture target opened by this display object. When a
+      // window-follow session falls back to display capture (or reattaches to a
+      // window) after a reinit, the orientation/resolution logic must follow the
+      // new target immediately.
+      const bool is_window_capture = display_is_window_capture(display.get());
+      if (have_last_target && is_window_capture != last_target_was_window_capture) {
+        BOOST_LOG(info) << "Capture target changed between "
+                        << (is_window_capture ? "display and window" : "window and display")
+                        << "; refreshing resolution and orientation state";
+        last_display_width = 0;
+        last_display_height = 0;
+      }
+      last_target_was_window_capture = is_window_capture;
+      have_last_target = true;
 
       // Helper lambda to compute even-aligned resolution with minimum 64
       auto compute_aligned_resolution = [](int dimension, float scale) {

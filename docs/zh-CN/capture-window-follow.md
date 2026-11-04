@@ -80,16 +80,19 @@ Content-Type: application/json
   "mode": "foreground",          // foreground | title | pid（默认 foreground）
   "window_title": "",            // mode=title 时必填
   "process_id": 0,               // mode=pid 时必填
-  "session_id": 0,               // 可选：0=自动选择唯一的活动视频会话
-  "client_uuid": ""              // 可选：按客户端证书 UUID 选择会话
+  "session_id": 0,               // 可选：按会话 ID 定向（多会话时 enable 仍 409）
+  "client_uuid": ""              // 可选：按客户端证书 UUID 定向（必须唯一匹配）
 }
 ```
 
 选择会话规则：
 
-- 指定 `session_id` → 按会话 ID 匹配；
-- 指定 `client_uuid` → 按客户端证书 UUID 匹配；
-- 都不指定：恰好 1 个活动视频会话 → 自动选中；0 个 → 404；多个 → 409 要求显式指定（**绝不**静默修改多个会话）。
+- `action=enable`：**只有恰好 1 个活动视频会话时才允许开启**。存在多个活动视频会话时一律返回 409，即使请求显式指定了 `session_id` 或 `client_uuid`。这是多会话过渡期的限制：多个会话可能共享捕获线程/捕获后端，开启时的重建无法保证只影响被选中的会话。
+- `action=disable` / `action=status`：保留定向操作：
+  - 指定 `session_id` → 按会话 ID 匹配；
+  - 指定 `client_uuid` → 按客户端证书 UUID 匹配；若匹配到多个会话，返回 409 并要求改用 `session_id`；
+  - 都不指定：恰好 1 个活动视频会话 → 自动选中；0 个 → 404；多个 → 409 要求显式指定。
+- 任何情况下都**绝不**静默修改多个会话；`disable` 只清理选中会话的窗口跟随状态，便于在多会话过渡期间回滚。
 
 成功响应与 GET 相同，并额外包含 `selected_session_id` / `selected_client_uuid`。
 
@@ -101,7 +104,7 @@ Content-Type: application/json
 | 401 | — | 鉴权失败 |
 | 403 | — | 非本机请求 |
 | 404 | `no_active_video_session` / `session_not_found` / `client_session_not_found` | 没有可控制的会话 |
-| 409 | `multiple_video_sessions_specify_session_id` / `wgc_requires_user_mode` | 多会话需显式指定 / 服务模式不支持 |
+| 409 | `multiple_video_sessions_enable_not_supported` / `multiple_video_sessions_specify_session_id` / `multiple_client_sessions_specify_session_id` / `wgc_requires_user_mode` | 多会话时不允许开启 / disable·status 多会话需显式指定 / client_uuid 匹配多个会话需 session_id / 服务模式不支持 |
 | 500 | `session_capture_target_unavailable` | 会话缺少捕获目标对象 |
 
 ## 与 Playnite 插件联动
@@ -117,7 +120,7 @@ Content-Type: application/json
 - **默认全部关闭**：没有任何客户端调用该端点时，捕获路径、配置解析、Web UI 与原生 Sunshine 完全一致。
 - 不新增必填配置项；`sunshine.conf` 与 `apps.json` 无需迁移。
 - 不影响：桌面串流、从 Moonlight 直接启动应用、Web UI 配置、虚拟显示器/Zako Direct（窗口跟随会话会临时改用 WGC 捕获，会话内生效）。
-- 多会话场景：本版本要求"恰好一个活动视频会话"才会自动选中；多会话必须显式指定 `session_id`，且窗口跟随只重建该会话所在的共享捕获线程（若多个会话共享同一捕获线程，重建会影响该线程上的会话，请避免多会话混用）。
+- 多会话过渡限制：本版本只允许在**恰好一个活动视频会话**时开启窗口跟随。存在多个活动视频会话时，`enable` 即使显式指定 `session_id`/`client_uuid` 也会返回 409；`disable`/`status` 仍可按 `session_id` 定向，按 `client_uuid` 匹配到多个会话时会返回 409 并要求改用 `session_id`。窗口跟随只重建选中会话所在的共享捕获线程；在捕获线程尚未按会话隔离前，请避免在多个会话之间混用开启操作。
 
 ## 已知限制
 
@@ -126,6 +129,7 @@ Content-Type: application/json
 3. 仅覆盖 **异步共享捕获路径**（Windows 硬件编码器默认走此路径）；软件编码的同步捕获路径不会运行时重建，只会在会话开始时应用一次。
 4. HDR：窗口捕获的 HDR 元数据与显示器捕获不完全等价；HDR 串流建议仍用显示器捕获。
 5. 游戏窗口标题/前台切换依赖 Windows 窗口状态；某些启动器链（Playnite → 启动器 → 游戏）会短暂跟随启动器窗口，随后切到游戏窗口。
+6. 多活动视频会话期间不能开启新的窗口跟随（`enable` 一律 409）；需要开启时请先结束其它视频会话，使目标会话成为唯一活动视频会话。已经开启的会话仍可通过 `disable` 定向恢复。
 
 ## 手工验证清单
 
@@ -148,10 +152,19 @@ Content-Type: application/json
 
 ## 回滚
 
+Plan4 以普通提交合入，仓库不提供反向补丁文件。回滚时按提交反向应用：
+
 ```powershell
 cd <foundation-sunshine>
-git apply -R plan4-window-follow.patch   # 反向应用补丁
-# 或 git checkout -- src cmake
+git log --oneline --grep="Plan4"   # 找到 Plan4 相关提交
+git revert <plan4-commit>...       # 按从新到旧的顺序逐个反向应用
+```
+
+如果只是丢弃尚未提交的本地修改：
+
+```powershell
+git restore -- src cmake tests/fixtures/confighttp_routes.json `
+  docs/zh-CN/capture-window-follow.md PLAN4-WINDOW-FOLLOW.md
 ```
 
 没有配置迁移，回滚后无需任何清理。

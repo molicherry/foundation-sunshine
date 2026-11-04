@@ -8,6 +8,7 @@
   #define __kernel_entry
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
@@ -79,7 +80,11 @@ namespace proc {
 
   class proc_t {
   public:
-    KITTY_DEFAULT_CONSTR_MOVE_THROW(proc_t)
+    proc_t() = default;
+    proc_t(const proc_t &) = delete;
+    proc_t &operator=(const proc_t &) = delete;
+    proc_t(proc_t &&other);
+    proc_t &operator=(proc_t &&other);
 
     proc_t(
       boost::process::v1::environment &&env,
@@ -145,7 +150,8 @@ namespace proc {
     int _app_id;
 
     // PID of the tracked app process; 0 when no process is tracked.
-    std::uint32_t _app_pid { 0 };
+    // Read from display/capture threads and written from the launch path.
+    std::atomic<std::uint32_t> _app_pid { 0 };
 
     std::string _apps_etag;
 

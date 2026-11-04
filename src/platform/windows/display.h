@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -199,6 +200,34 @@ namespace platf::dxgi {
     captured_display_name() const override;
 
     bool captures_monitor = true;
+
+    /**
+     * @brief Rectangle of the captured window in virtual-screen coordinates.
+     *
+     * WGC window capture has no fixed monitor: the window can move between
+     * displays (including displays with different DPI scales). Absolute
+     * mouse/touch/pen input must therefore be mapped to this rectangle instead
+     * of the monitor that happened to host the window at init time.
+     * Offsets are relative to the virtual-screen origin, matching display_t's
+     * offset_x/offset_y convention.
+     */
+    struct window_capture_rect_t {
+      int offset_x = 0;
+      int offset_y = 0;
+      int width = 0;
+      int height = 0;
+
+      bool
+      valid() const {
+        return width > 0 && height > 0;
+      }
+    };
+
+    window_capture_rect_t window_capture_rect;
+    bool has_window_capture_rect = false;
+    // Guards window_capture_rect/has_window_capture_rect between the capture
+    // thread (window movement) and the encoder thread (absolute input port).
+    std::mutex window_capture_rect_mutex;
 
     int
     init(const ::video::config_t &config, const std::string &display_name);
@@ -528,6 +557,18 @@ namespace platf::dxgi {
   recover_secure_desktop();
 
   /**
+   * @brief A WGC window frame size change requires a full backend reinit.
+   *
+   * Reusing the staging texture or an image buffer from the previous size is
+   * unsafe: a same-width/increased-height frame would overflow the old
+   * allocation, and the encoder/SWS session would keep the old source size.
+   */
+  inline bool
+  wgc_window_size_requires_reinit(int target_width, int target_height, int frame_width, int frame_height) {
+    return frame_width != target_width || frame_height != target_height;
+  }
+
+  /**
    * Display duplicator that uses the Windows.Graphics.Capture API.
    */
   class wgc_capture_t {
@@ -539,8 +580,19 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame { nullptr }, consumed_frame { nullptr };
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    display_base_t *display = nullptr;
     void
     on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
+
+    /**
+     * @brief Refresh the captured window rectangle on the owning display.
+     *
+     * Called on every frame so a moving/resized window keeps absolute input
+     * aligned, and after init/switch so the first frame already uses the new
+     * target. Clears the rectangle for display capture.
+     */
+    void
+    refresh_window_capture_rect();
 
   public:
     HWND captured_window_hwnd { nullptr };  // Store window handle if capturing a window

@@ -181,6 +181,16 @@
     "windows": true
   },
   {
+    "pattern": "^/api/capture/window-follow$",
+    "method": "GET",
+    "windows": true
+  },
+  {
+    "pattern": "^/api/capture/window-follow$",
+    "method": "POST",
+    "windows": true
+  },
+  {
     "pattern": "^/api/password$",
     "method": "POST"
   },

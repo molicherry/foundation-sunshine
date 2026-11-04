@@ -348,15 +348,20 @@ namespace platf::dxgi {
       img->row_pitch = img->pixel_pitch * img->width;
     }
 
-    // Reallocate the image buffer if the pitch changes
+    // Reallocate the image buffer if the pitch changes. Capture backends must
+    // not change img->width/height in place and reuse the old buffer: a
+    // same-width/grown-height frame would overflow this allocation. Window
+    // size changes instead return capture_e::reinit so the image and encoder
+    // session are rebuilt with matching dimensions.
     if (!dummy && img->row_pitch != img_info.RowPitch) {
       img->row_pitch = img_info.RowPitch;
-      delete img->data;
+      delete[] img->data;
       img->data = nullptr;
     }
 
     if (!img->data) {
-      // Use img->height instead of height to support window capture with different dimensions
+      // Use img->height instead of the display height to support window capture
+      // with different dimensions.
       img->data = new std::uint8_t[img->row_pitch * img->height];
     }
 

@@ -1210,12 +1210,6 @@ namespace platf {
       }
     });
 
-    // Plan4: let the launched application (and the game it launches) bring its
-    // window to the foreground. Sunshine itself runs in the background and
-    // Windows' foreground lock would otherwise keep the previous foreground
-    // window (for example a remote agent/browser) on top.
-    AllowSetForegroundWindow(ASFW_ANY);
-
     BOOL ret;
     if (is_running_as_system()) {
       // Duplicate the current user's token

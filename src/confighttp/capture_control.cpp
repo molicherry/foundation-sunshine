@@ -160,6 +160,13 @@ namespace confighttp::capture_control {
      * Selection order: explicit `session_id`, then explicit `client_uuid`, then
      * the single active video session.  Multiple active sessions without an
      * explicit selector are rejected instead of being changed silently.
+     *
+     * Enabling is stricter: while more than one video session is active it is
+     * rejected even when the caller explicitly selects a session.  The capture
+     * thread and its display backend may be shared by multiple sessions, so an
+     * enable/reinit transition could disturb the other sessions on that thread.
+     * Disable and status remain targetable so an existing override can still be
+     * inspected or rolled back during a multi-session transition.
      */
     void
     get_window_follow(resp_https_t response, req_https_t request) {
@@ -223,6 +230,16 @@ namespace confighttp::capture_control {
       const bool supported = window_follow_supported(unsupported_reason);
 
       auto sessions = active_video_sessions();
+
+      // Enabling while multiple video sessions are active is rejected for all
+      // callers, including callers that name a session explicitly.  The
+      // capture thread/display backend can be shared, so an enable transition
+      // would not be isolated to the selected session.
+      if (action == "enable" && sessions.size() > 1) {
+        write_json_error(response, web::StatusCode::conflict, "multiple_video_sessions_enable_not_supported");
+        return;
+      }
+
       const session_control_t *selected = nullptr;
 
       if (requested_session_id != 0) {
@@ -239,10 +256,14 @@ namespace confighttp::capture_control {
       }
       else if (!requested_client_uuid.empty()) {
         for (const auto &session : sessions) {
-          if (session.client_cert_uuid == requested_client_uuid) {
-            selected = &session;
-            break;
+          if (session.client_cert_uuid != requested_client_uuid) {
+            continue;
           }
+          if (selected) {
+            write_json_error(response, web::StatusCode::conflict, "multiple_client_sessions_specify_session_id");
+            return;
+          }
+          selected = &session;
         }
         if (!selected) {
           write_json_error(response, web::StatusCode::not_found, "client_session_not_found");

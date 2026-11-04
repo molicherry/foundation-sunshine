@@ -422,6 +422,61 @@ namespace platf::dxgi {
   }
 
   /**
+   * @brief True when @p hwnd belongs to one of the shell hosts that use the
+   *        generic Windows.UI.Core.CoreWindow class.
+   *
+   * Windows.UI.Core.CoreWindow is also the class of ordinary UWP applications
+   * (Settings, Calculator, Store apps), so the class name alone is not a valid
+   * shell filter. Only the specific shell processes are excluded here.
+   */
+  static bool
+  is_shell_core_window(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) {
+      return false;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+      return false;
+    }
+
+    wchar_t image_path[MAX_PATH] = {};
+    DWORD image_path_size = static_cast<DWORD>(std::size(image_path));
+    const bool queried = QueryFullProcessImageNameW(process, 0, image_path, &image_path_size) != FALSE;
+    CloseHandle(process);
+    if (!queried || image_path_size == 0) {
+      return false;
+    }
+
+    std::wstring_view image_name { image_path, image_path_size };
+    if (const auto slash = image_name.find_last_of(L"\\/"); slash != std::wstring_view::npos) {
+      image_name.remove_prefix(slash + 1);
+    }
+
+    std::wstring lower_name { image_name };
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::towlower);
+
+    static constexpr std::wstring_view shell_processes[] = {
+      L"explorer.exe",
+      L"startmenuexperiencehost.exe",
+      L"shellexperiencehost.exe",
+      L"searchhost.exe",
+      L"searchapp.exe",
+      L"textinputhost.exe",
+      L"lockapp.exe",
+      L"peopleexperiencehost.exe",
+    };
+    for (const auto shell_process : shell_processes) {
+      if (lower_name == shell_process) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * @brief Plan4: decide whether a top-level window may be followed by the
    *        per-session window-follow capture.
    *
@@ -468,7 +523,6 @@ namespace platf::dxgi {
         L"Shell_TrayWnd",
         L"Shell_SecondaryTrayWnd",
         L"TaskListThumbnailWnd",
-        L"Windows.UI.Core.CoreWindow",
         L"MultitaskingViewFrame",
         L"ForegroundStaging",
       };
@@ -477,6 +531,12 @@ namespace platf::dxgi {
         if (cls == shell_class) {
           return false;
         }
+      }
+
+      // CoreWindow is shared by the shell and ordinary UWP apps; filter only
+      // the known shell hosts instead of rejecting every UWP window.
+      if (cls == L"Windows.UI.Core.CoreWindow" && is_shell_core_window(hwnd)) {
+        return false;
       }
     }
 
@@ -813,6 +873,86 @@ namespace platf::dxgi {
     observed.hwnd = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(hwnd));
   }
 
+  /**
+   * @brief Query the visible window rectangle in physical virtual-screen pixels.
+   *
+   * Sunshine opts into per-monitor DPI awareness before creating the display
+   * backend, so GetWindowRect()/DWM return physical pixels even when the window
+   * moves to a monitor with a different scale. DWMWA_EXTENDED_FRAME_BOUNDS
+   * excludes the invisible resize border and better matches what WGC captures.
+   */
+  static bool
+  query_window_screen_rect(HWND hwnd, RECT &rect) {
+    if (!hwnd || !IsWindow(hwnd)) {
+      return false;
+    }
+
+    RECT candidate {};
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &candidate, sizeof(candidate))) &&
+        candidate.right > candidate.left && candidate.bottom > candidate.top) {
+      rect = candidate;
+    }
+    else if (!GetWindowRect(hwnd, &candidate) ||
+             candidate.right <= candidate.left || candidate.bottom <= candidate.top) {
+      return false;
+    }
+    else {
+      rect = candidate;
+    }
+
+    const int virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (virtual_width <= 0 || virtual_height <= 0) {
+      return false;
+    }
+
+    // Clamp to the current virtual desktop. A window straddling monitors must
+    // never produce an absolute pointer outside the normalized 0..65535 range.
+    rect.left = std::clamp<LONG>(rect.left, virtual_x, virtual_x + virtual_width);
+    rect.top = std::clamp<LONG>(rect.top, virtual_y, virtual_y + virtual_height);
+    rect.right = std::clamp<LONG>(rect.right, virtual_x, virtual_x + virtual_width);
+    rect.bottom = std::clamp<LONG>(rect.bottom, virtual_y, virtual_y + virtual_height);
+    return rect.right > rect.left && rect.bottom > rect.top;
+  }
+
+  void
+  wgc_capture_t::refresh_window_capture_rect() {
+    if (!display) {
+      return;
+    }
+
+    if (!captured_window_hwnd) {
+      std::lock_guard lock(display->window_capture_rect_mutex);
+      display->has_window_capture_rect = false;
+      display->window_capture_rect = {};
+      return;
+    }
+
+    RECT rect {};
+    if (!query_window_screen_rect(captured_window_hwnd, rect)) {
+      // Keep the last known rectangle while the window is temporarily
+      // unqueryable; is_window_valid() will request a reinit if it disappears.
+      return;
+    }
+
+    const int virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    std::lock_guard lock(display->window_capture_rect_mutex);
+    display->window_capture_rect.offset_x = rect.left - virtual_x;
+    display->window_capture_rect.offset_y = rect.top - virtual_y;
+    display->window_capture_rect.width = rect.right - rect.left;
+    display->window_capture_rect.height = rect.bottom - rect.top;
+    display->has_window_capture_rect = display->window_capture_rect.valid();
+
+    // Keep the absolute-input environment in sync with monitor topology changes
+    // (hot-plug, resolution change, DPI change) while the window is captured.
+    display->env_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    display->env_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  }
+
   wgc_capture_t::wgc_capture_t() {
     InitializeConditionVariable(&frame_present_cv);
   }
@@ -839,8 +979,15 @@ namespace platf::dxgi {
    */
   int
   wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+    this->display = display;
     frame_counter = display->frame_rate_source();
     frame_counter->kind.store(perf::capture_source_kind_e::wgc_arrivals, std::memory_order_relaxed);
+    display->captures_monitor = true;
+    {
+      std::lock_guard lock(display->window_capture_rect_mutex);
+      display->has_window_capture_rect = false;
+      display->window_capture_rect = {};
+    }
     // WGC is not supported in service mode (running as SYSTEM user)
     // Fail fast to avoid unnecessary attempts and potential deadlocks
     if (is_running_as_system_user) {
@@ -1016,6 +1163,7 @@ namespace platf::dxgi {
           else {
             captured_window_hwnd = target_hwnd;
             display->captures_monitor = false;
+            refresh_window_capture_rect();
             // The client's mouse/gamepad input is routed to the foreground
             // window; make the captured game window the foreground window.
             focus_capture_window(target_hwnd);
@@ -1083,6 +1231,7 @@ namespace platf::dxgi {
           // A window can move between monitors while this capture stays open.
           // It has no fixed current monitor for display-scale control.
           display->captures_monitor = false;
+          refresh_window_capture_rect();
 
           auto window_size = item.Size();
           window_capture_width = static_cast<int>(window_size.Width);
@@ -1106,6 +1255,12 @@ namespace platf::dxgi {
     // If not capturing window (either not requested or fallback), capture display
     if (!capture_window) {
       captured_window_hwnd = nullptr;  // Not capturing a window
+      display->captures_monitor = true;
+      {
+        std::lock_guard lock(display->window_capture_rect_mutex);
+        display->has_window_capture_rect = false;
+        display->window_capture_rect = {};
+      }
       window_capture_width = 0;
       window_capture_height = 0;
       if (display->output == nullptr) {
@@ -1221,6 +1376,7 @@ namespace platf::dxgi {
   capture_e
   wgc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
     // this CONSUMER runs in the capture thread
+    refresh_window_capture_rect();
     release_frame();
 
     AcquireSRWLockExclusive(&frame_lock);
@@ -1422,15 +1578,17 @@ namespace platf::dxgi {
     int frame_width = static_cast<int>(desc.Width);
     int frame_height = static_cast<int>(desc.Height);
 
-    // For window capture, update stored dimensions if they changed
+    // For window capture, a size change invalidates the staging texture, the
+    // image pool and the encoder/SWS session dimensions. Never mutate img in
+    // place: the memory pool may still contain buffers for the old height, and
+    // a same-width/increased-height frame would then write past the allocation.
     if (dup.captured_window_hwnd != nullptr) {
-      if (dup.window_capture_width != frame_width || dup.window_capture_height != frame_height) {
+      if (wgc_window_size_requires_reinit(
+            dup.window_capture_width, dup.window_capture_height,
+            frame_width, frame_height)) {
         BOOST_LOG(info) << "Window capture size changed: "sv << dup.window_capture_width << 'x' << dup.window_capture_height
-                        << " -> "sv << frame_width << 'x' << frame_height;
-        dup.window_capture_width = frame_width;
-        dup.window_capture_height = frame_height;
-        // Reset texture to force recreation with new size
-        texture.reset();
+                        << " -> "sv << frame_width << 'x' << frame_height << ", reinitializing capture"sv;
+        return capture_e::reinit;
       }
     }
     else {
@@ -1495,13 +1653,6 @@ namespace platf::dxgi {
       return capture_e::interrupted;
     }
     auto img = (img_t *) img_out.get();
-
-    // Plan4: window capture may reuse image buffers allocated for a different
-    // resolution (for example when switching from display capture to window
-    // capture). Keep the image dimensions in sync with the captured frame so
-    // the encoder conversion (SWS) sees matching line sizes.
-    img->width = frame_width;
-    img->height = frame_height;
 
     // Map the staging texture for CPU access (making it inaccessible for the GPU)
     if (FAILED(status = device_ctx->Map(texture.get(), 0, D3D11_MAP_READ, 0, &img_info))) {
