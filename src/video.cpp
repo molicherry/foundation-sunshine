@@ -3564,8 +3564,22 @@ namespace video {
     std::optional<safe::mail_raw_t::event_t<dynamic_param_t>> dynamic_param_events,
     std::function<std::unique_ptr<encode_session_t>()> session_factory = {},
     std::function<void()> backend_failure_handler = {}) {
-    auto session = session_factory ? session_factory() :
-      make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
+    std::unique_ptr<encode_session_t> session;
+    if (session_factory) {
+      session = session_factory();
+    }
+    else {
+      // Plan4: window-follow capture can be smaller than the display. Size the
+      // encoder from the current capture image so the SWS conversion receives
+      // matching source dimensions and line sizes.
+      int session_width = disp->width;
+      int session_height = disp->height;
+      if (auto session_img = disp->alloc_img()) {
+        session_width = session_img->width;
+        session_height = session_img->height;
+      }
+      session = make_encode_session(disp.get(), encoder, config, session_width, session_height, std::move(encode_device));
+    }
     if (!session) {
       if (backend_failure_handler) {
         BOOST_LOG(warning) << "Encoder session could not be initialized; requesting backend recovery"sv;
@@ -3982,7 +3996,7 @@ namespace video {
     auto device = make_encode_device(context.display, context.encoder, context.config);
     if (!device) return false;
     auto replacement = make_encode_session(&context.display, context.encoder, context.config,
-      context.display.width, context.display.height, std::move(device), false, bitrate_kbps);
+      context.image.width, context.image.height, std::move(device), false, bitrate_kbps);
     // Prepare the current image before replacing the working encoder. A failed
     // rebuild leaves both the old encoder and its FEC allowance intact.
     if (!replacement || replacement->convert(context.image)) return false;
@@ -4747,15 +4761,21 @@ namespace video {
       return -1;
     }
 
-    auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device), true);
+    auto img = disp->alloc_img();
+    if (!img) {
+      return -1;
+    }
+
+    // Plan4: window-follow capture can differ from the display size; size the
+    // encoder from the capture image so the dummy-frame conversion matches.
+    auto session = make_encode_session(disp.get(), encoder, config, img->width, img->height, std::move(encode_device), true);
     if (!session) {
       return -1;
     }
 
     {
       // Image buffers are large, so we use a separate scope to free it immediately after convert()
-      auto img = disp->alloc_img();
-      if (!img || disp->dummy_img(img.get()) || session->convert(*img)) {
+      if (disp->dummy_img(img.get()) || session->convert(*img)) {
         return -1;
       }
     }

@@ -621,41 +621,102 @@ namespace platf::dxgi {
   }
 
   /**
-   * @brief Plan4: foreground candidates for window-follow mode.
+   * @brief Plan4: process filter for window-follow candidates.
    *
    * Only the Sunshine-launched application process tree, plus processes started
    * around/after the override was enabled, may be followed. This keeps a
-   * game-exit transient (desktop, browser, launcher or any unrelated app that
-   * grabs foreground) from being streamed to the client.
+   * game-exit transient (desktop, browser, launcher or any unrelated app) from
+   * being streamed to the client.
    */
-  static HWND
-  find_override_foreground_window(std::uint32_t root_process_id, std::int64_t enabled_at_unix_ms) {
-    HWND candidate = find_eligible_foreground_window();
-    if (!candidate) {
-      return nullptr;
-    }
-
-    DWORD candidate_pid = 0;
-    GetWindowThreadProcessId(candidate, &candidate_pid);
-    if (candidate_pid == 0) {
-      return nullptr;
+  static bool
+  is_override_pid_allowed(DWORD process_id, std::uint32_t root_process_id, std::int64_t enabled_at_unix_ms) {
+    if (process_id == 0) {
+      return false;
     }
 
     if (root_process_id != 0 &&
-        (candidate_pid == root_process_id || is_process_descendant_of(root_process_id, candidate_pid))) {
-      return candidate;
+        (process_id == root_process_id || is_process_descendant_of(root_process_id, process_id))) {
+      return true;
     }
 
     if (enabled_at_unix_ms > 0) {
-      const auto started_at = process_start_unix_ms(candidate_pid);
+      const auto started_at = process_start_unix_ms(process_id);
       // 10 seconds of slack: the game may have started slightly before the
       // control client's (delayed) enable request.
       if (started_at != 0 && started_at + 10000 >= enabled_at_unix_ms) {
-        return candidate;
+        return true;
       }
     }
 
-    return nullptr;
+    return false;
+  }
+
+  /**
+   * @brief Plan4: topmost eligible top-level window in Z-order, optionally
+   *        restricted to descendants of the Sunshine-launched app process.
+   */
+  static HWND
+  find_topmost_override_window(std::uint32_t root_process_id, std::int64_t enabled_at_unix_ms, bool descendants_only) {
+    struct state_t {
+      std::uint32_t root_process_id;
+      std::int64_t enabled_at_unix_ms;
+      bool descendants_only;
+      HWND result;
+    } state { root_process_id, enabled_at_unix_ms, descendants_only, nullptr };
+
+    EnumWindows(
+      [](HWND hwnd, LPARAM lparam) -> BOOL {
+        auto *data = reinterpret_cast<state_t *>(lparam);
+        if (!is_window_capture_eligible(hwnd)) {
+          return TRUE;
+        }
+        DWORD window_pid = 0;
+        GetWindowThreadProcessId(hwnd, &window_pid);
+        if (!is_override_pid_allowed(window_pid, data->root_process_id, data->enabled_at_unix_ms)) {
+          return TRUE;
+        }
+        if (data->descendants_only) {
+          if (data->root_process_id == 0 || window_pid == data->root_process_id ||
+              !is_process_descendant_of(data->root_process_id, window_pid)) {
+            return TRUE;
+          }
+        }
+        data->result = hwnd;
+        return FALSE;
+      },
+      reinterpret_cast<LPARAM>(&state));
+
+    return state.result;
+  }
+
+  /**
+   * @brief Plan4: eligible foreground window for window-follow mode.
+   *
+   * The game window (a descendant of the Sunshine-launched app) is preferred
+   * over the launcher's own fullscreen window: capturing Playnite itself looks
+   * like the whole screen and made the capture flap between Playnite and the
+   * game. When there is no foreground window at all (locked/disconnected RDP
+   * session), the topmost eligible window in Z-order is used instead.
+   */
+  static HWND
+  find_override_foreground_window(std::uint32_t root_process_id, std::int64_t enabled_at_unix_ms) {
+    HWND child_window = find_topmost_override_window(root_process_id, enabled_at_unix_ms, true);
+
+    HWND candidate = find_eligible_foreground_window();
+    if (candidate) {
+      DWORD candidate_pid = 0;
+      GetWindowThreadProcessId(candidate, &candidate_pid);
+      if (is_override_pid_allowed(candidate_pid, root_process_id, enabled_at_unix_ms)) {
+        const bool is_launcher = root_process_id != 0 && candidate_pid == root_process_id;
+        return is_launcher && child_window ? child_window : candidate;
+      }
+    }
+
+    if (child_window) {
+      return child_window;
+    }
+
+    return find_topmost_override_window(root_process_id, enabled_at_unix_ms, false);
   }
 
   /**
@@ -682,6 +743,53 @@ namespace platf::dxgi {
       case streaming::window_capture_mode_e::foreground:
       default:
         return find_override_foreground_window(root_process_id, enabled_at_unix_ms);
+    }
+  }
+
+  /**
+   * @brief Plan4: try to bring a captured window to the foreground.
+   *
+   * Sunshine is a background process, so Windows' foreground lock normally
+   * rejects SetForegroundWindow(). run_command() grants ASFW_ANY before spawning
+   * the app, but that does not cover windows created later, so retry here with
+   * the AttachThreadInput helper. Mouse and gamepad input follow the foreground
+   * window, therefore the captured game window must become foreground for the
+   * client to control it.
+   */
+  static void
+  focus_capture_window(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+      return;
+    }
+
+    if (IsIconic(hwnd)) {
+      ShowWindow(hwnd, SW_RESTORE);
+    }
+
+    // Locked/disconnected sessions reject SetForegroundWindow(); raising the
+    // window in the Z-order still makes it visible in display capture and lets
+    // the injected mouse/gamepad input reach it in active sessions.
+    BringWindowToTop(hwnd);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    if (SetForegroundWindow(hwnd)) {
+      return;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    const DWORD foreground_thread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD current_thread = GetCurrentThreadId();
+    bool attached = false;
+    if (foreground_thread != 0 && foreground_thread != current_thread) {
+      attached = AttachThreadInput(current_thread, foreground_thread, TRUE) != FALSE;
+    }
+
+    SetForegroundWindow(hwnd);
+
+    if (attached) {
+      AttachThreadInput(current_thread, foreground_thread, FALSE);
     }
   }
 
@@ -908,6 +1016,9 @@ namespace platf::dxgi {
           else {
             captured_window_hwnd = target_hwnd;
             display->captures_monitor = false;
+            // The client's mouse/gamepad input is routed to the foreground
+            // window; make the captured game window the foreground window.
+            focus_capture_window(target_hwnd);
             auto window_size = item.Size();
             window_capture_width = static_cast<int>(window_size.Width);
             window_capture_height = static_cast<int>(window_size.Height);
@@ -1384,6 +1495,13 @@ namespace platf::dxgi {
       return capture_e::interrupted;
     }
     auto img = (img_t *) img_out.get();
+
+    // Plan4: window capture may reuse image buffers allocated for a different
+    // resolution (for example when switching from display capture to window
+    // capture). Keep the image dimensions in sync with the captured frame so
+    // the encoder conversion (SWS) sees matching line sizes.
+    img->width = frame_width;
+    img->height = frame_height;
 
     // Map the staging texture for CPU access (making it inaccessible for the GPU)
     if (FAILED(status = device_ctx->Map(texture.get(), 0, D3D11_MAP_READ, 0, &img_info))) {

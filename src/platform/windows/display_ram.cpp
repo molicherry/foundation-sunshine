@@ -374,7 +374,7 @@ namespace platf::dxgi {
       return -1;
     }
 
-    std::fill_n((std::uint8_t *) img->data, height * img->row_pitch, 0);
+    std::fill_n((std::uint8_t *) img->data, img->height * img->row_pitch, 0);
     return 0;
   }
 
