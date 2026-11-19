@@ -2247,14 +2247,33 @@ namespace rtsp_stream {
       return;
     }
     std::string announce_payload { payload };
+
+    // Plan4: defensive guard for direct RTSP clients. The HTTP /launch path
+    // rejects a second video session while another session follows a window;
+    // enforce the same admission rule here so a client that skips /launch (or
+    // races it) cannot join the followed window's capture thread.
+    if (!session.control_only &&
+        stream::window_follow_is_busy() &&
+        !stream::window_follow_allows_video_session(session.id)) {
+      BOOST_LOG(info) << "Rejecting session: another session is following a window"sv;
+      respond(sock, session, &option, 503, "Service Unavailable - window-follow active", req->sequenceNumber, {});
+      return;
+    }
+
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);
 
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
+    const int start_result = stream::session::start(*stream_session, sock.remote_endpoint().address().to_string());
+    if (start_result) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       server->remove(stream_session);
-      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      if (start_result == -2) {
+        respond(sock, session, &option, 503, "Service Unavailable - window-follow admission busy", req->sequenceNumber, {});
+      }
+      else {
+        respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      }
       return;
     }
 
@@ -2262,6 +2281,19 @@ namespace rtsp_stream {
     session.stream_announce_payload = std::move(announce_payload);
     session.endpoint_auto_refresh = config.endpoint_auto_refresh;
     session.stream_session_started = true;
+    // Every /resume ticket carries a deferred NV_APP_RESUME. Consume it once
+    // after a successful video start; control-only sessions consume it
+    // without sending, and failed/expired tickets never reach this branch.
+    auto pending_resume_event = std::exchange(session.pending_resume_event, std::nullopt);
+    if (!session.control_only && pending_resume_event) {
+      try {
+        pending_resume_event->timestamp = webhook::get_current_timestamp();
+        webhook::send_event_async(*pending_resume_event);
+      }
+      catch (...) {
+        BOOST_LOG(error) << "Webhook resume event enqueue failed"sv;
+      }
+    }
     session.mat_live_selected = config.audio.codec == audio::CODEC_MAT_LIVE;
     if (session.mat_live_selected) BOOST_LOG(info) << "Native live MAT negotiated: AEAD counter64; no finite replay";
     session.nvidia_vsync_lease.reset();

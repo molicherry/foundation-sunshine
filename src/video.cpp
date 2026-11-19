@@ -54,6 +54,7 @@ extern "C" {
 #include "video_hdr_metadata.h"
 #include "video_idle_policy.h"
 #include "video_probe.h"
+#include "video_touch_port.h"
 
 #ifdef _WIN32
   #include "nvenc/win/nvenc_dynamic_factory.h"
@@ -67,8 +68,20 @@ extern "C" {
   #include "platform/windows/display_device/windows_utils.h"
 #endif
 
+
+namespace stream {
+  void
+  confirm_window_follow_capture(const std::shared_ptr<streaming::capture_target_t> &target,
+                                std::uint64_t generation,
+                                bool display_capture);
+}  // namespace stream
+
 using namespace std::literals;
 namespace video {
+
+  // Defined below; encode_run() re-publishes this when a captured window moves.
+  input::touch_port_t
+  make_port(platf::display_t *display, const config_t &config);
 
   namespace {
     std::mutex hdr_pipeline_status_mutex;
@@ -1209,6 +1222,7 @@ namespace video {
     config_t config;
     int frame_nr;
     void *channel_data;
+    std::optional<input::touch_port_t> last_touch_port;
   };
 
   struct sync_session_t {
@@ -1911,6 +1925,32 @@ namespace video {
     }
   }
 
+  /**
+   * @brief Plan4: confirm which override generation the display was built for.
+   *
+   * The generation is read before creating the display. If a newer request
+   * arrived while the backend was being built, the capture loop detects the
+   * mismatch and reinitializes; acknowledging the stale generation here would
+   * let disable() reopen admission while the display still captures a window.
+   */
+  void
+  acknowledge_capture(const config_t &config, const platf::display_t &disp, std::uint64_t generation) {
+    if (!config.capture_target || config.capture_target->window_override_generation() != generation) {
+      return;
+    }
+
+    bool display_capture = true;
+#ifdef _WIN32
+    if (const auto *dxgi_display = dynamic_cast<const platf::dxgi::display_base_t *>(&disp)) {
+      display_capture = dxgi_display->captures_monitor;
+    }
+#endif
+    config.capture_target->acknowledge_capture(generation, display_capture);
+    // The capture thread owns the release of admission: only it knows that the
+    // backend for this exact generation is now running.
+    stream::confirm_window_follow_capture(config.capture_target, generation, display_capture);
+  }
+
   void
   captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
@@ -1982,6 +2022,13 @@ namespace video {
     // Use client-specified display_name if provided, otherwise use the selected display
     std::string target_display_name;
     auto config = capture_ctxs.front().config;
+
+    // Plan4: track the per-session window-follow override generation so the
+    // capture backend is reinitialized when a control client switches the
+    // capture target for this session.
+    std::uint64_t last_override_generation =
+      config.capture_target ? config.capture_target->window_override_generation() : 0;
+
     if (!config.display_name.empty()) {
       // config.display_name may be a device ID (e.g., {xxx-xxx-xxx}) rather than display name (e.g., \\.\DISPLAY1)
       // Try to convert device ID to display name first
@@ -2017,6 +2064,7 @@ namespace video {
       return;
     }
     publish_capture_target(config, *disp);
+    acknowledge_capture(config, *disp, last_override_generation);
     active_display_event->raise(target_display_name);
     display_wp = disp;
 
@@ -2151,6 +2199,18 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
+      // Plan4: react to window-follow override changes between capture
+      // iterations as well; WGC may idle on static content and the push
+      // callback is not guaranteed to run promptly after an override change.
+      if (!capture_ctxs.empty()) {
+        const auto &front_config = capture_ctxs.front().config;
+        const auto override_generation =
+          front_config.capture_target ? front_config.capture_target->window_override_generation() : 0;
+        if (override_generation != last_override_generation) {
+          artificial_reinit = true;
+        }
+      }
+
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
@@ -2168,6 +2228,19 @@ namespace video {
         if (force_system_capture.load(std::memory_order_acquire)) {
           artificial_reinit = true;
           return false;
+        }
+
+        // Plan4: a local control client changed the window-follow override for
+        // this session; rebuild the display backend with the new target.
+        if (!capture_ctxs.empty()) {
+          const auto &front_config = capture_ctxs.front().config;
+          const auto override_generation =
+            front_config.capture_target ? front_config.capture_target->window_override_generation() : 0;
+          if (override_generation != last_override_generation) {
+            last_override_generation = override_generation;
+            artificial_reinit = true;
+            return false;
+          }
         }
 
         // 先接入新会话，再分发本次真实画面。若本次只是捕获超时，则给新会话
@@ -2291,12 +2364,25 @@ namespace video {
             }
 
             // reset_display() will sleep between retries
+            const auto capture_generation = config.capture_target ?
+                                              config.capture_target->window_override_generation() :
+                                              0;
             reset_capture_display(disp, target_display_name, config);
             if (disp) {
               for (auto &capture_ctx : capture_ctxs) {
                 publish_capture_target(capture_ctx.config, *disp);
               }
+              // Plan4: drop the previous backend's latest frame before
+              // confirming the restore. Do not clear the image pool here: the
+              // capture loop still recycles those buffers and clearing it
+              // stalls capture on static windows.
+              latest_captured_img.reset();
+              acknowledge_capture(config, *disp, capture_generation);
               active_display_event->raise(target_display_name);
+              // Record the generation this display was actually built from,
+              // not the latest request. If disable arrived during the rebuild,
+              // the loop compares against this value and rebuilds again.
+              last_override_generation = capture_generation;
               break;
             }
           }
@@ -3619,8 +3705,22 @@ namespace video {
     std::optional<safe::mail_raw_t::event_t<dynamic_param_t>> dynamic_param_events,
     std::function<std::unique_ptr<encode_session_t>()> session_factory = {},
     std::function<void()> backend_failure_handler = {}) {
-    auto session = session_factory ? session_factory() :
-      make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
+    std::unique_ptr<encode_session_t> session;
+    if (session_factory) {
+      session = session_factory();
+    }
+    else {
+      // Plan4: window-follow capture can be smaller than the display. Size the
+      // encoder from the current capture image so the SWS conversion receives
+      // matching source dimensions and line sizes.
+      int session_width = disp->width;
+      int session_height = disp->height;
+      if (auto session_img = disp->alloc_img()) {
+        session_width = session_img->width;
+        session_height = session_img->height;
+      }
+      session = make_encode_session(disp.get(), encoder, config, session_width, session_height, std::move(encode_device));
+    }
     if (!session) {
       if (backend_failure_handler) {
         BOOST_LOG(warning) << "Encoder session could not be initialized; requesting backend recovery"sv;
@@ -3693,6 +3793,9 @@ namespace video {
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto dynamic_param_events_ptr = dynamic_param_events.value_or(mail::man->event<dynamic_param_t>(mail::dynamic_param_change));
     auto input_activity_event = mail->event<std::chrono::steady_clock::time_point>(mail::input_activity);
+    auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+    auto last_touch_port = make_port(disp.get(), config);
+    touch_port_event->raise(last_touch_port);
     auto input_boost_until = std::chrono::steady_clock::time_point::min();
 
     auto consume_input_activity = [&]() {
@@ -3780,6 +3883,14 @@ namespace video {
       // the blank dummy frame just to let Moonlight know that we're alive.
       if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
         break;
+      }
+
+      // Window capture can move or change size without triggering a reinit.
+      // Re-publish absolute-input geometry when the captured window rectangle
+      // changed, and keep display capture on its existing monitor geometry.
+      if (const auto port = make_port(disp.get(), config); !touch_ports_equal(last_touch_port, port)) {
+        touch_port_event->raise(port);
+        last_touch_port = port;
       }
 
       bool requested_idr_frame = false;
@@ -3929,35 +4040,52 @@ namespace video {
 
   input::touch_port_t
   make_port(platf::display_t *display, const config_t &config) {
-    float wd = display->width;
-    float hd = display->height;
+    int target_width = 0;
+    int target_height = 0;
+    int target_offset_x = 0;
+    int target_offset_y = 0;
+    int env_width = 0;
+    int env_height = 0;
 
-    float wt = config.width;
-    float ht = config.height;
+#ifdef _WIN32
+    // Window capture has no fixed monitor: use the window's current
+    // virtual-screen rectangle so absolute mouse/touch/pen input stays aligned
+    // after the window moves, switches monitors, or changes size/DPI.
+    if (auto *dxgi_display = dynamic_cast<platf::dxgi::display_base_t *>(display);
+        dxgi_display && !dxgi_display->captures_monitor) {
+      // The capture thread updates the window rectangle and the virtual-screen
+      // extents together under this mutex. Read all of them inside the same
+      // lock; reading env_* before acquiring it races with a move/resize.
+      std::lock_guard lock(dxgi_display->window_capture_rect_mutex);
+      env_width = dxgi_display->env_width;
+      env_height = dxgi_display->env_height;
+      if (dxgi_display->has_window_capture_rect) {
+        target_width = dxgi_display->window_capture_rect.width;
+        target_height = dxgi_display->window_capture_rect.height;
+        target_offset_x = dxgi_display->window_capture_rect.offset_x;
+        target_offset_y = dxgi_display->window_capture_rect.offset_y;
+      }
+    }
+#endif
 
-    auto scalar = std::fminf(wt / wd, ht / hd);
+    // Display capture (and the temporary window-capture fallback before a
+    // rectangle is known) keeps the display geometry.
+    if (target_width <= 0 || target_height <= 0) {
+      target_width = display->width;
+      target_height = display->height;
+      target_offset_x = display->offset_x;
+      target_offset_y = display->offset_y;
+      if (env_width == 0 || env_height == 0) {
+        env_width = display->env_width;
+        env_height = display->env_height;
+      }
+    }
 
-    auto w2 = scalar * wd;
-    auto h2 = scalar * hd;
-
-    auto offsetX = (config.width - w2) * 0.5f;
-    auto offsetY = (config.height - h2) * 0.5f;
-
-    return input::touch_port_t {
-      {
-        display->offset_x,
-        display->offset_y,
-        config.width,
-        config.height,
-      },
-      display->env_width,
-      display->env_height,
-      display->width,
-      display->height,
-      offsetX,
-      offsetY,
-      1.0f / scalar,
-    };
+    return make_touch_port_for_rect(
+      config.width, config.height,
+      target_width, target_height,
+      target_offset_x, target_offset_y,
+      env_width, env_height);
   }
 
   /**
@@ -4048,7 +4176,7 @@ namespace video {
     auto device = make_encode_device(context.display, context.encoder, context.config);
     if (!device) return false;
     auto replacement = make_encode_session(&context.display, context.encoder, context.config,
-      context.display.width, context.display.height, std::move(device), false, bitrate_kbps);
+      context.image.width, context.image.height, std::move(device), false, bitrate_kbps);
     // Prepare the current image before replacing the working encoder. A failed
     // rebuild leaves both the old encoder and its FEC allowance intact.
     if (!replacement || replacement->convert(context.image)) return false;
@@ -4211,6 +4339,17 @@ namespace video {
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+        // Refresh window-capture absolute-input geometry before encoding this
+        // frame. make_synced_session() seeds the port for new contexts; this
+        // path handles later window movement without a capture reinit.
+        for (auto &touch_ctx : synced_session_ctxs) {
+          const auto port = make_port(disp.get(), touch_ctx->config);
+          if (!touch_ctx->last_touch_port || !touch_ports_equal(*touch_ctx->last_touch_port, port)) {
+            touch_ctx->touch_port_events->raise(port);
+            touch_ctx->last_touch_port = port;
+          }
+        }
+
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
@@ -4409,8 +4548,20 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    // Cache window capture mode check outside the loop
-    const bool is_window_capture = (config::video.capture_target == "window");
+    // The capture target can change across reinitializations (window-follow
+    // falls back to a display when no window exists, and later reattaches).
+    // Never cache this at startup: orientation and resolution handling must use
+    // the target actually opened by the current display object.
+    const auto display_is_window_capture = [&config](const platf::display_t *display) {
+#ifdef _WIN32
+      if (const auto *dxgi_display = dynamic_cast<const platf::dxgi::display_base_t *>(display)) {
+        return !dxgi_display->captures_monitor;
+      }
+#endif
+      // Preserve existing global window-capture semantics outside DXGI.
+      return config::video.capture_target == "window" ||
+        (config.capture_target && config.capture_target->window_override_enabled());
+    };
     const bool is_pyrowave = config.videoFormat == static_cast<int>(LI_PYROWAVE_VIDEO_FORMAT);
 #ifdef _WIN32
     bool pyrowave_gpu_disabled = false;
@@ -4422,6 +4573,12 @@ namespace video {
     // Track display dimensions for resolution change detection
     int last_display_width = 0;
     int last_display_height = 0;
+
+    // Track whether the previous reinit captured a window or a monitor. A
+    // window/display transition must re-evaluate orientation and resolution
+    // instead of inheriting the previous target's cached geometry.
+    bool last_target_was_window_capture = false;
+    bool have_last_target = false;
 
     // Track initial scale ratio (encoding resolution / display resolution)
     // Used to maintain consistent scaling when display resolution changes
@@ -4452,6 +4609,21 @@ namespace video {
       // For WGC window capture, display->width/height is monitor resolution, not window size
       const int current_width = display->width;
       const int current_height = display->height;
+
+      // Read the actual capture target opened by this display object. When a
+      // window-follow session falls back to display capture (or reattaches to a
+      // window) after a reinit, the orientation/resolution logic must follow the
+      // new target immediately.
+      const bool is_window_capture = display_is_window_capture(display.get());
+      if (have_last_target && is_window_capture != last_target_was_window_capture) {
+        BOOST_LOG(info) << "Capture target changed between "
+                        << (is_window_capture ? "display and window" : "window and display")
+                        << "; refreshing resolution and orientation state";
+        last_display_width = 0;
+        last_display_height = 0;
+      }
+      last_target_was_window_capture = is_window_capture;
+      have_last_target = true;
 
       // Helper lambda to compute even-aligned resolution with minimum 64
       auto compute_aligned_resolution = [](int dimension, float scale) {
@@ -4823,15 +4995,21 @@ namespace video {
       return -1;
     }
 
-    auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device), true);
+    auto img = disp->alloc_img();
+    if (!img) {
+      return -1;
+    }
+
+    // Plan4: window-follow capture can differ from the display size; size the
+    // encoder from the capture image so the dummy-frame conversion matches.
+    auto session = make_encode_session(disp.get(), encoder, config, img->width, img->height, std::move(encode_device), true);
     if (!session) {
       return -1;
     }
 
     {
       // Image buffers are large, so we use a separate scope to free it immediately after convert()
-      auto img = disp->alloc_img();
-      if (!img || disp->dummy_img(img.get()) || session->convert(*img)) {
+      if (disp->dummy_img(img.get()) || session->convert(*img)) {
         return -1;
       }
     }

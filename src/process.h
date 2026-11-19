@@ -8,6 +8,7 @@
   #define __kernel_entry
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -82,7 +83,11 @@ namespace proc {
 
   class proc_t {
   public:
-    KITTY_DEFAULT_CONSTR_MOVE_THROW(proc_t)
+    proc_t() = default;
+    proc_t(const proc_t &) = delete;
+    proc_t &operator=(const proc_t &) = delete;
+    proc_t(proc_t &&other);
+    proc_t &operator=(proc_t &&other);
 
     proc_t(
       boost::process::v1::environment &&env,
@@ -119,6 +124,17 @@ namespace proc {
     get_running_pid() const;
     std::string
     get_last_run_app_name();
+
+    /**
+     * @brief PID of the application process launched by Sunshine.
+     *
+     * Returns 0 for the Desktop app or when no tracked application process is
+     * running (for example detached/placebo apps). Used by the per-session
+     * window-follow capture to restrict foreground candidates to the launched
+     * application's process tree and to processes started for the game.
+     */
+    std::uint32_t
+    get_app_pid();
     std::optional<rtsp_stream::synthetic_hdr_config_t>
     get_app_rtx_hdr_config(int app_id) const;
     std::optional<rtsp_stream::dlssnr_config_t>
@@ -151,6 +167,10 @@ namespace proc {
     lifecycle_mutex_t _lifecycle_mutex;
 
     int _app_id;
+
+    // PID of the tracked app process; 0 when no process is tracked.
+    // Read from display/capture threads and written from the launch path.
+    std::atomic<std::uint32_t> _app_pid { 0 };
 
     std::string _apps_etag;
 

@@ -4327,6 +4327,12 @@ namespace platf::dxgi {
    */
   capture_e
   display_wgc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    // Plan4: react to window-follow target changes before touching the frame
+    // queue; reinit lets the capture thread rebuild the backend.
+    if (const auto override_status = dup.poll_window_override(); override_status != capture_e::ok) {
+      return override_status;
+    }
+
     // Check if window is still valid (if capturing a window)
     // If window becomes invalid (closed, minimized, hidden), fall back to display capture
     if (!dup.is_window_valid()) {
@@ -4354,12 +4360,19 @@ namespace platf::dxgi {
     D3D11_TEXTURE2D_DESC desc;
     src->GetDesc(&desc);
 
-    // Get the actual captured frame dimensions
+    // Get the actual captured frame dimensions. The texture keeps the size of
+    // the frame pool it was created from, so window resize detection must use
+    // the capture item's live content size instead.
     int frame_width = static_cast<int>(desc.Width);
     int frame_height = static_cast<int>(desc.Height);
 
     // For window capture, check if size changed and handle it
     if (dup.captured_window_hwnd != nullptr) {
+      if (const auto content = dup.content_size(); content.Width > 0 && content.Height > 0) {
+        frame_width = static_cast<int>(content.Width);
+        frame_height = static_cast<int>(content.Height);
+      }
+
       int expected_width = dup.window_capture_width > 0 ? dup.window_capture_width : width_before_rotation;
       int expected_height = dup.window_capture_height > 0 ? dup.window_capture_height : height_before_rotation;
 

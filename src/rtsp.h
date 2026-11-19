@@ -18,6 +18,7 @@
 #include "image_enhancement/config.h"
 #include "launch_session_manager.h"
 #include "src/platform/frame_contract.h"
+#include "webhook/webhook.h"
 
 namespace stream::session {
   enum class stop_reason_e : int;
@@ -112,6 +113,12 @@ namespace rtsp_stream {
     dlssnr_config_t dlssnr_params;
     int dlssnr_scale_percent { 100 };
     boost::shared_ptr<const image_enhancement::backend_use_t> dlssnr_backend;
+
+    // Set on /resume while window-follow is busy. The ticket is issued, but
+    // the application-resume webhook is published only after RTSP actually
+    // starts an ordinary video stream; pure control-only sessions and
+    // rejected/expired tickets never publish it.
+    std::optional<webhook::event_t> pending_resume_event;
 
     // Resolved frame-pipeline policy for this session, published by RTSP SETUP
     // so display preparation consumes the same decision as the capture/encode

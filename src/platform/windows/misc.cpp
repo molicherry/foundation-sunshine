@@ -1295,7 +1295,17 @@ namespace platf {
       free_proc_thread_attr_list(list);
     });
 
-    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+
+    // CREATE_BREAKAWAY_FROM_JOB is rejected with ERROR_ACCESS_DENIED when Sunshine
+    // itself was started inside a job object that does not allow breakaway (for
+    // example when launched by a desktop agent/sandbox). Only request it when we
+    // are not nested in such a job; otherwise CreateProcess() would fail even
+    // though a normal launch succeeds.
+    BOOL sunshine_in_job_query = FALSE;
+    if (!IsProcessInJob(GetCurrentProcess(), NULL, &sunshine_in_job_query) || !sunshine_in_job_query) {
+      creation_flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
 
     // Create a new console for interactive processes and use no console for non-interactive processes
     creation_flags |= interactive ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
@@ -1324,6 +1334,14 @@ namespace platf {
         sunshine_wenv[path_var_name].assign(old_path_val);
       }
     });
+
+    // Plan4: grant the launched application (and the game it launches) the
+    // ability to bring its window to the foreground. Sunshine starts apps from
+    // the background, and Windows' foreground lock would otherwise keep the
+    // previous foreground window (for example a remote agent/browser) on top.
+    // Mouse and gamepad input follow the foreground window, so this is required
+    // for the streamed session to control the game.
+    AllowSetForegroundWindow(ASFW_ANY);
 
     BOOL ret;
     if (is_running_as_system()) {

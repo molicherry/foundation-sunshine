@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -157,6 +158,29 @@ namespace stream {
     streaming::capture_target_result_t
     current_capture_for_client(const std::string &client_cert_uuid);
 
+    /**
+     * @brief One session exposed to local capture-control clients (Plan4).
+     */
+    struct video_session_control_t {
+      std::uint32_t session_id { 0 };
+      std::string client_cert_uuid;
+      std::string client_name;
+      std::string app_name;
+      bool running { false };
+      bool control_only { false };
+      std::shared_ptr<streaming::capture_target_t> capture_target;
+    };
+
+    /**
+     * @brief Snapshot of all active sessions for local capture-control requests.
+     *
+     * The capture target handle is shared with the session, so callers can read
+     * and update the per-session window-follow override without touching the
+     * global Sunshine configuration.
+     */
+    std::vector<video_session_control_t>
+    list_video_sessions_for_control();
+
     bool
     has_active_video_sessions();
 
@@ -210,4 +234,68 @@ namespace stream {
     std::vector<session_info_t>
     get_all_sessions_info();
   }  // namespace session
+
+  /**
+   * @brief Plan4: true when a running video session follows a window.
+   *
+   * Shared admission constraint: window-follow can only be enabled with one
+   * active video session, and another video session is rejected while this
+   * is true. Keeping both decisions on the same fact prevents a late-joining
+   * session from sharing the capture thread that serves the followed window.
+   */
+  bool
+  any_window_override_active();
+
+  /** @brief Plan4: true while a window-follow transition blocks new video. */
+  bool
+  window_follow_is_busy();
+
+  /** @brief Plan4: whether this ticket may retry RTSP while follow is active. */
+  bool
+  window_follow_allows_video_session(std::uint32_t session_id);
+
+  /**
+   * @brief Plan4: install a follow request for the single registered session.
+   *
+   * Validates the registration table under the coordinator lock; only the
+   * selected session and capture target may enter the following state.
+   */
+  bool
+  enable_window_follow(std::uint32_t session_id,
+                       const std::string &client_cert_uuid,
+                       const std::shared_ptr<streaming::capture_target_t> &target,
+                       std::function<void()> operation);
+
+  struct window_follow_disable_t {
+    bool owner { false };
+    bool idle { false };
+    std::uint64_t generation { 0 };
+  };
+
+  /** @brief Plan4: clear the follow request and enter the restoring state. */
+  window_follow_disable_t
+  disable_window_follow(const std::shared_ptr<streaming::capture_target_t> &target);
+
+  enum class window_follow_wait_e {
+    restored,
+    superseded,
+    timeout,
+  };
+
+  /** @brief Plan4: wait for this disable generation to be confirmed. */
+  window_follow_wait_e
+  wait_window_follow_restore(const std::shared_ptr<streaming::capture_target_t> &target,
+                             std::uint64_t generation,
+                             std::chrono::milliseconds timeout);
+
+  /**
+   * @brief Plan4: capture-thread confirmation for a restored generation.
+   *
+   * Releases admission only when the session, generation and restored capture
+   * kind match; duplicate or stale confirmations have no effect.
+   */
+  void
+  confirm_window_follow_capture(const std::shared_ptr<streaming::capture_target_t> &target,
+                                std::uint64_t generation,
+                                bool display_capture);
 }  // namespace stream

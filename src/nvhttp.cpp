@@ -651,6 +651,21 @@ namespace nvhttp {
       return;
     }
 
+    // Plan4: the same admission constraint as enable. A capture thread serves
+    // one display to all attached sessions; while a session follows a window,
+    // a second video session would receive that window's frames. Reject the
+    // launch before the app starts and let the client retry after the followed
+    // session turns window-follow off or ends.
+    if (stream::window_follow_is_busy()) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message",
+        "Another stream is following a window; retry after it turns window-follow off or ends");
+      BOOST_LOG(info) << "Rejecting launch: another session is following a window"sv;
+
+      return;
+    }
+
     // Early validation of AppID to prevent starting VDD or other expensive operations
     // if the requested app does not exist.
     if (proc::proc.get_app_name(appid).empty()) {
@@ -916,6 +931,17 @@ namespace nvhttp {
     }
     launch_session->touch_family = request_is_touch_family(args, request->header);
     hdr::resolve_session_target(*launch_session);
+
+    // Plan4: window-follow is following or restoring. The stream type is not
+    // known yet, so keep issuing the ticket and let RTSP/start() decide:
+    // control-only sessions skip video admission, while a new video session is
+    // rejected with a retryable 503. Do not reconfigure display or probe
+    // encoders for this request while the existing session owns capture.
+    const bool window_follow_busy = stream::window_follow_is_busy();
+    if (window_follow_busy) {
+      BOOST_LOG(info) << "Resume while window-follow is active: issuing ticket, video admission deferred to RTSP"sv;
+    }
+
     if (launch_session->highly_suspected_unknown_client) {
       BOOST_LOG(warning) << "Resume request highly resembles a known unauthorized client fork"
                          << " [client_uuid=" << client_cert_uuid
@@ -925,7 +951,7 @@ namespace nvhttp {
                          << ", rule_source=" << fingerprint_match.source << ']';
     }
 
-    if (no_active_sessions) {
+    if (no_active_sessions && !window_follow_busy) {
       // Prepare before publishing the ticket so the handshake expiration
       // window starts only when the host is ready to accept RTSP.
       if (!stream_start::prepare_display_and_probe_encoders(tree, *launch_session, false)) {
@@ -953,31 +979,7 @@ namespace nvhttp {
     }
 #endif
 
-    if (!register_launch_ticket(tree, launch_session, "resume")) {
-      return;
-    }
-
-    tree.put("root.<xmlattr>.status_code", 200);
-    tree.put("root.sessionUrl0", launch_session->rtsp_url_scheme +
-                                   net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
-                                   std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
-    tree.put("root.resume", 1);
-    // The app already runs. The Panel shows the launch splash only if the game's window is still missing a moment after this.
-    if (const auto running_app = proc::proc.running(); running_app > 0 && !proc::proc.get_app_cmd(running_app).empty()) {
-      const auto &apps = proc::proc.get_apps();
-      const auto app = std::find_if(apps.begin(), apps.end(), [&](const auto &candidate) { return candidate.id == std::to_string(running_app); });
-      if (app != apps.end() && launch_splash::begin(*app, launch_splash::kind_e::resume)) {
-        if (const auto pid = proc::proc.get_running_pid()) {
-          launch_splash::note_started(static_cast<std::uint32_t>(*pid), true);
-        }
-      }
-    }
-    reachability::observe_client(
-      net::addr_to_normalized_string(request->remote_endpoint().address()),
-      reachability::now_epoch_seconds());
-    need_to_restore_display_state = false;
-
-    try {
+    const auto make_resume_event = [&]() -> webhook::event_t {
       const auto app_id = proc::proc.running();
       std::map<std::string, std::string> extra_data {
         { "resolution", std::to_string(launch_session->width) + "x" + std::to_string(launch_session->height) },
@@ -989,7 +991,7 @@ namespace nvhttp {
           "client_integrity_warning",
           client_fingerprint::suspicious_client_code);
       }
-      webhook::send_event_async(webhook::event_t {
+      return webhook::event_t {
         .type = webhook::event_type_t::NV_APP_RESUME,
         .timestamp = webhook::get_current_timestamp(),
         .client_name = launch_session->client_name,
@@ -998,11 +1000,47 @@ namespace nvhttp {
         .app_name = proc::proc.get_app_name(app_id),
         .app_id = app_id,
         .session_id = std::to_string(launch_session->id),
-        .extra_data = std::move(extra_data) });
+        .extra_data = std::move(extra_data)
+      };
+    };
+
+    // Every /resume ticket carries the pending application-resume event; RTSP
+    // publishes it only after an ordinary video session actually starts. This
+    // also covers the case where the request looked idle at HTTP time but
+    // window-follow began before RTSP admission.
+    try {
+      launch_session->pending_resume_event = make_resume_event();
     }
     catch (...) {
-      BOOST_LOG(error) << "Webhook resume event construction failed"sv;
+      BOOST_LOG(error) << "Webhook resume event construction failed (deferred)"sv;
     }
+
+    if (!register_launch_ticket(tree, launch_session, "resume")) {
+      return;
+    }
+
+    tree.put("root.<xmlattr>.status_code", 200);
+    tree.put("root.sessionUrl0", launch_session->rtsp_url_scheme +
+                                   net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
+                                   std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
+    tree.put("root.resume", 1);
+    if (!window_follow_busy) {
+      // The app already runs. The Panel shows the launch splash only if the
+      // game's window is still missing a moment after this.
+      if (const auto running_app = proc::proc.running(); running_app > 0 && !proc::proc.get_app_cmd(running_app).empty()) {
+        const auto &apps = proc::proc.get_apps();
+        const auto app = std::find_if(apps.begin(), apps.end(), [&](const auto &candidate) { return candidate.id == std::to_string(running_app); });
+        if (app != apps.end() && launch_splash::begin(*app, launch_splash::kind_e::resume)) {
+          if (const auto pid = proc::proc.get_running_pid()) {
+            launch_splash::note_started(static_cast<std::uint32_t>(*pid), true);
+          }
+        }
+      }
+    }
+    reachability::observe_client(
+      net::addr_to_normalized_string(request->remote_endpoint().address()),
+      reachability::now_epoch_seconds());
+    need_to_restore_display_state = false;
   }
 
   void

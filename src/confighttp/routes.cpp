@@ -10,6 +10,7 @@
 #include "src/confighttp/apps_scan.h"
 #include "src/confighttp/assets.h"
 #include "src/confighttp/auth.h"
+#include "src/confighttp/capture_control.h"
 #include "src/confighttp/clients.h"
 #include "src/confighttp/common.h"
 #include "src/confighttp/configuration.h"
@@ -51,6 +52,7 @@ namespace confighttp {
     confighttp::systeminfo::register_routes(server);
     confighttp::telemetry_api::register_routes(server);
     confighttp::proxies::register_routes(server);
+    confighttp::capture_control::register_routes(server);
     file_mapping::config_http::register_routes(server);
     ai::http::register_routes(server);
 

@@ -231,6 +231,7 @@ set(SUNSHINE_HOST_SOURCES
     src/confighttp/integrations.cpp src/confighttp/integrations.h
     src/confighttp/pairing.cpp src/confighttp/pairing.h
     src/confighttp/proxies.cpp src/confighttp/proxies.h
+    src/confighttp/capture_control.cpp src/confighttp/capture_control.h
     src/confighttp/routes.cpp src/confighttp/routes.h
     src/confighttp/types.h
     src/confighttp/asset_paths.h

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -801,99 +802,272 @@ namespace stream {
   }
 
   namespace session {
-    // 高位表示显示设备正在重配置，低 31 位记录已登记的视频会话数。
-    // 两者共用一个原子状态，确保“确认单会话”和“取得重配置权”由同一次 CAS 完成。
-    constexpr std::uint32_t VIDEO_SESSION_RECONFIGURING = std::uint32_t { 1 } << 31;
-    constexpr std::uint32_t VIDEO_SESSION_COUNT_MASK = ~VIDEO_SESSION_RECONFIGURING;
+    struct video_session_record_t {
+      std::string client_cert_uuid;
+      std::shared_ptr<streaming::capture_target_t> target;
+    };
+
+    struct video_session_coordinator_t {
+      enum class follow_state_e {
+        idle,
+        following,
+        restoring,
+      };
+
+      std::mutex mutex;
+      std::condition_variable cv;
+      follow_state_e follow_state { follow_state_e::idle };
+      bool reconfiguring { false };
+      std::uint32_t owner_session_id { 0 };
+      std::string owner_client_uuid;
+      std::shared_ptr<streaming::capture_target_t> owner_target;
+      std::uint64_t restore_generation { 0 };
+      std::unordered_map<std::uint32_t, video_session_record_t> video_sessions;
+    };
+
+    video_session_coordinator_t video_coordinator;
 
     std::atomic_uint running_sessions;
-    boost::atomic<std::uint32_t> video_session_state { 0 };
 
-    // 在创建音视频线程前登记会话。显示设备重配置期间，新会话在此等待占用位释放，
-    // 避免会话启动和 VDD 重建同时进行。返回值表示它是否是首个视频会话。
+    // Plan4: register one video session before starting its threads. The
+    // registration table and the window-follow state are the single source of
+    // truth for admission; a session that is starting already occupies a slot.
     std::optional<bool>
-    register_video_session() {
-      auto state = video_session_state.load(boost::memory_order_acquire);
-      for (;;) {
-        if ((state & VIDEO_SESSION_RECONFIGURING) != 0) {
-          state = video_session_state.wait(state, boost::memory_order_acquire);
-          continue;
-        }
+    register_video_session(std::uint32_t session_id,
+                           std::string_view client_cert_uuid,
+                           std::shared_ptr<streaming::capture_target_t> target) {
+      std::unique_lock lock(video_coordinator.mutex);
+      video_coordinator.cv.wait(lock, [] {
+        return !video_coordinator.reconfiguring;
+      });
 
-        const auto count = state & VIDEO_SESSION_COUNT_MASK;
-        if (count == VIDEO_SESSION_COUNT_MASK) {
-          BOOST_LOG(error) << "Cannot register another video session because the session counter is exhausted"sv;
-          return std::nullopt;
-        }
-
-        if (video_session_state.compare_exchange_weak(
-              state,
-              state + 1,
-              boost::memory_order_acq_rel,
-              boost::memory_order_acquire)) {
-          return count == 0;
-        }
+      if (video_coordinator.video_sessions.find(session_id) != video_coordinator.video_sessions.end()) {
+        // RTSP idempotent retry for a ticket that already registered.
+        return video_coordinator.video_sessions.size() == 1;
       }
+
+      if (video_coordinator.follow_state != video_session_coordinator_t::follow_state_e::idle) {
+        return std::nullopt;
+      }
+
+      const bool first = video_coordinator.video_sessions.empty();
+      video_coordinator.video_sessions.emplace(session_id, video_session_record_t {
+        std::string { client_cert_uuid }, std::move(target)
+      });
+      return first;
     }
 
-    // 只递减低位的会话计数，保留可能并发存在的重配置占用位。
-    // 返回注销后的会话数，由最后一个会话负责执行平台停止和显示恢复逻辑。
+    // Plan4: unregister after the video thread and capture references are gone.
     std::uint32_t
-    unregister_video_session() {
-      auto state = video_session_state.load(boost::memory_order_acquire);
-      for (;;) {
-        const auto count = state & VIDEO_SESSION_COUNT_MASK;
-        if (count == 0) {
-          BOOST_LOG(error) << "Cannot unregister a video session because the session counter is already zero"sv;
-          return 0;
-        }
+    unregister_video_session(std::uint32_t session_id) {
+      std::lock_guard lock(video_coordinator.mutex);
+      video_coordinator.video_sessions.erase(session_id);
 
-        const auto desired = (state & VIDEO_SESSION_RECONFIGURING) | (count - 1);
-        if (video_session_state.compare_exchange_weak(
-              state,
-              desired,
-              boost::memory_order_acq_rel,
-              boost::memory_order_acquire)) {
-          return count - 1;
-        }
+      const auto remaining = static_cast<std::uint32_t>(video_coordinator.video_sessions.size());
+      if (remaining == 0 && video_coordinator.follow_state != video_session_coordinator_t::follow_state_e::idle) {
+        // The owner and its capture are gone: open admission for future sessions.
+        video_coordinator.follow_state = video_session_coordinator_t::follow_state_e::idle;
+        video_coordinator.owner_session_id = 0;
+        video_coordinator.owner_client_uuid.clear();
+        video_coordinator.owner_target.reset();
+        video_coordinator.restore_generation = 0;
+        video_coordinator.cv.notify_all();
       }
+      return remaining;
     }
 
     std::uint32_t
     video_session_count() {
-      return video_session_state.load(boost::memory_order_acquire) & VIDEO_SESSION_COUNT_MASK;
+      std::lock_guard lock(video_coordinator.mutex);
+      return static_cast<std::uint32_t>(video_coordinator.video_sessions.size());
     }
 
+    // Plan4: the existing single-session display-reconfiguration semantics,
+    // expressed on the same registration table.
     template <class F>
     bool
     run_display_reconfiguration_if_single_video_session(F &&operation) {
-      // 只有恰好一个视频会话时才允许重配置。CAS 成功设置占用位后，
-      // 后续视频会话会在 register_video_session() 中等待，不会进入重建窗口。
-      auto state = video_session_state.load(boost::memory_order_acquire);
-      for (;;) {
-        if ((state & VIDEO_SESSION_RECONFIGURING) != 0 ||
-            (state & VIDEO_SESSION_COUNT_MASK) != 1) {
-          return false;
-        }
-
-        if (video_session_state.compare_exchange_weak(
-              state,
-              state | VIDEO_SESSION_RECONFIGURING,
-              boost::memory_order_acq_rel,
-              boost::memory_order_acquire)) {
-          break;
-        }
+      std::unique_lock lock(video_coordinator.mutex);
+      if (video_coordinator.reconfiguring || video_coordinator.video_sessions.size() != 1) {
+        return false;
       }
 
-      // 无论重配置正常返回还是抛出异常，都必须清除占用位并唤醒等待的新会话。
-      auto reconfiguration_guard = util::fail_guard([]() {
-        video_session_state.fetch_and(VIDEO_SESSION_COUNT_MASK, boost::memory_order_release);
-        video_session_state.notify_all();
+      video_coordinator.reconfiguring = true;
+      lock.unlock();
+
+      auto guard = util::fail_guard([&]() {
+        std::lock_guard reacquire(video_coordinator.mutex);
+        video_coordinator.reconfiguring = false;
+        video_coordinator.cv.notify_all();
       });
+
       std::forward<F>(operation)();
       return true;
     }
+
   }  // namespace session
+
+  bool
+  window_follow_is_busy() {
+    std::lock_guard lock(session::video_coordinator.mutex);
+    return session::video_coordinator.follow_state != session::video_session_coordinator_t::follow_state_e::idle;
+  }
+
+  bool
+  window_follow_allows_video_session(std::uint32_t session_id) {
+    std::lock_guard lock(session::video_coordinator.mutex);
+    if (session::video_coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::idle) {
+      return true;
+    }
+
+    // An already registered ticket may retry RTSP idempotently.
+    return session::video_coordinator.video_sessions.find(session_id) !=
+           session::video_coordinator.video_sessions.end();
+  }
+
+  /**
+   * @brief Plan4: install a follow request for the single registered session.
+   */
+  bool
+  enable_window_follow(std::uint32_t session_id,
+                       const std::string &client_cert_uuid,
+                       const std::shared_ptr<streaming::capture_target_t> &target,
+                       std::function<void()> operation) {
+    std::lock_guard lock(session::video_coordinator.mutex);
+    auto &coordinator = session::video_coordinator;
+
+    if (coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::following) {
+      if (coordinator.owner_session_id != session_id || coordinator.owner_target != target) {
+        return false;
+      }
+    }
+    else if (coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::restoring) {
+      if (coordinator.owner_session_id != session_id || coordinator.owner_target != target) {
+        return false;
+      }
+    }
+    else {
+      if (coordinator.video_sessions.size() != 1) {
+        return false;
+      }
+
+      const auto record = coordinator.video_sessions.find(session_id);
+      if (record == coordinator.video_sessions.end() || record->second.target != target) {
+        return false;
+      }
+    }
+
+    coordinator.follow_state = session::video_session_coordinator_t::follow_state_e::following;
+    coordinator.owner_session_id = session_id;
+    coordinator.owner_client_uuid = client_cert_uuid;
+    coordinator.owner_target = target;
+    coordinator.restore_generation = 0;
+    operation();
+    coordinator.cv.notify_all();
+    return true;
+  }
+
+  /**
+   * @brief Plan4: clear the follow request and enter the restoring state.
+   *
+   * The clear and the restore-generation record happen under the coordinator
+   * lock, so the capture thread cannot confirm a version that was never
+   * recorded. Repeated disable on the same owner reuses the first version.
+   */
+  window_follow_disable_t
+  disable_window_follow(const std::shared_ptr<streaming::capture_target_t> &target) {
+    std::lock_guard lock(session::video_coordinator.mutex);
+    auto &coordinator = session::video_coordinator;
+
+    if (coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::idle) {
+      return { true, true, 0 };
+    }
+
+    if (coordinator.owner_target != target) {
+      return { false, false, 0 };
+    }
+
+    if (coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::restoring) {
+      return { true, false, coordinator.restore_generation };
+    }
+
+    const auto generation = target->clear_window_override();
+    coordinator.follow_state = session::video_session_coordinator_t::follow_state_e::restoring;
+    coordinator.restore_generation = generation;
+    coordinator.cv.notify_all();
+    return { true, false, generation };
+  }
+
+  /**
+   * @brief Plan4: wait for this disable generation to be confirmed.
+   *
+   * A new enable while restoring transitions the coordinator back to
+   * following; that is reported as "superseded" so the HTTP request can return
+   * 409 instead of pretending the disable completed.
+   */
+  window_follow_wait_e
+  wait_window_follow_restore(const std::shared_ptr<streaming::capture_target_t> &target,
+                             std::uint64_t generation,
+                             std::chrono::milliseconds timeout) {
+    std::unique_lock lock(session::video_coordinator.mutex);
+    auto &coordinator = session::video_coordinator;
+
+    if (coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::idle) {
+      return window_follow_wait_e::restored;
+    }
+
+    if (coordinator.follow_state != session::video_session_coordinator_t::follow_state_e::restoring ||
+        coordinator.owner_target != target ||
+        coordinator.restore_generation != generation) {
+      return window_follow_wait_e::superseded;
+    }
+
+    const auto done = coordinator.cv.wait_for(lock, timeout, [&] {
+      return coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::idle ||
+             coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::following ||
+             coordinator.owner_target != target ||
+             coordinator.restore_generation != generation;
+    });
+
+    if (!done) {
+      return window_follow_wait_e::timeout;
+    }
+
+    return coordinator.follow_state == session::video_session_coordinator_t::follow_state_e::idle ?
+             window_follow_wait_e::restored :
+             window_follow_wait_e::superseded;
+  }
+
+  /**
+   * @brief Plan4: capture-thread confirmation for a restored generation.
+   *
+   * Runs after the new backend is running and the old frame references are
+   * released. Admission is released only when the session, generation and
+   * restored capture kind all match; duplicate or stale confirmations do
+   * nothing. The HTTP waiters are woken in the same critical section.
+   */
+  void
+  confirm_window_follow_capture(const std::shared_ptr<streaming::capture_target_t> &target,
+                                std::uint64_t generation,
+                                bool display_capture) {
+    std::lock_guard lock(session::video_coordinator.mutex);
+    target->acknowledge_capture(generation, display_capture);
+
+    auto &coordinator = session::video_coordinator;
+    if (coordinator.follow_state != session::video_session_coordinator_t::follow_state_e::restoring ||
+        coordinator.owner_target != target ||
+        coordinator.restore_generation != generation) {
+      return;
+    }
+
+    coordinator.follow_state = session::video_session_coordinator_t::follow_state_e::idle;
+    coordinator.owner_session_id = 0;
+    coordinator.owner_client_uuid.clear();
+    coordinator.owner_target.reset();
+    coordinator.restore_generation = 0;
+    coordinator.cv.notify_all();
+    BOOST_LOG(info) << "Window-follow: capture confirmed generation "sv << generation << ", admission reopened"sv;
+  }
 
   /**
    * First part of cipher must be struct of type control_encrypted_t
@@ -4554,6 +4728,36 @@ namespace stream {
     return -1;
   }
 
+  /**
+   * @brief Plan4: whether any running session currently follows a window.
+   *
+   * Used as the shared admission constraint: window-follow may only be enabled
+   * with exactly one active video session, and a new video session is rejected
+   * while another session has it enabled. Keeping both decisions on the same
+   * fact avoids sharing a capture thread that is serving a followed window.
+   */
+  bool
+  any_window_override_active() {
+    auto broadcast_ref = broadcast_shared.try_ref();
+    if (!broadcast_ref) {
+      return false;
+    }
+
+    auto lg = broadcast_ref->control_server._sessions.lock();
+    for (const auto candidate : *broadcast_ref->control_server._sessions) {
+      if (!candidate || candidate->lifecycle.state() != session::state_e::RUNNING) {
+        continue;
+      }
+
+      const auto &target = candidate->config.monitor.capture_target;
+      if (target && target->window_override_enabled()) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   void
   videoThread(session_t *session) {
     auto global_shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -4796,6 +5000,36 @@ namespace stream {
       return streaming::select_current_capture(sessions, client_cert_uuid);
     }
 
+    std::vector<video_session_control_t>
+    list_video_sessions_for_control() {
+      std::vector<video_session_control_t> sessions;
+
+      // try_ref() avoids recreating the broadcast context when no stream is active.
+      auto broadcast_ref = broadcast_shared.try_ref();
+      if (!broadcast_ref) {
+        return sessions;
+      }
+
+      auto lg = broadcast_ref->control_server._sessions.lock();
+      sessions.reserve(broadcast_ref->control_server._sessions->size());
+      for (const auto session : *broadcast_ref->control_server._sessions) {
+        if (!session) {
+          continue;
+        }
+
+        video_session_control_t info;
+        info.session_id = session->launch_session_id;
+        info.client_cert_uuid = session->client_cert_uuid;
+        info.client_name = session->client_name;
+        info.app_name = session->app_name;
+        info.running = session->lifecycle.state() == state_e::RUNNING;
+        info.control_only = session->control_only;
+        info.capture_target = session->config.monitor.capture_target;
+        sessions.push_back(std::move(info));
+      }
+      return sessions;
+    }
+
     void
     join(session_t &session) {
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
@@ -4851,7 +5085,7 @@ namespace stream {
         const auto stop_reason = session.lifecycle.snapshot().stop_reason;
 
         // If this is the last non-control-only session, invoke the platform callbacks
-        if (unregister_video_session() == 0) {
+        if (unregister_video_session(session.launch_session_id) == 0) {
           launch_splash::end();  // the stream ended: a splash that is still up goes with it
           bool restore_display_state { true };
           if (proc::proc.running()) {
@@ -4972,9 +5206,14 @@ namespace stream {
       bool first_video_session { false };
       bool video_session_registered { false };
       if (!session.control_only) {
-        const auto registration = register_video_session();
+        const auto registration = register_video_session(
+          session.launch_session_id,
+          session.client_cert_uuid,
+          session.config.monitor.capture_target);
         if (!registration) {
-          return -1;
+          // Admission is temporarily closed: report a distinct result so RTSP
+          // can answer 503 instead of a generic failure.
+          return -2;
         }
 
         first_video_session = *registration;
@@ -4983,7 +5222,7 @@ namespace stream {
       // 登记后的启动失败由 guard 回退计数；正常进入 RUNNING 后转交 join() 注销。
       auto video_session_registration_guard = util::fail_guard([&]() {
         if (video_session_registered) {
-          unregister_video_session();
+          unregister_video_session(session.launch_session_id);
         }
       });
 

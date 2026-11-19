@@ -64,6 +64,44 @@ namespace proc {
 
   proc_t proc;
 
+  proc_t::proc_t(proc_t &&other):
+      _app_id(other._app_id),
+      _app_pid(other._app_pid.load(std::memory_order_relaxed)),
+      _apps_etag(std::move(other._apps_etag)),
+      _env(std::move(other._env)),
+      _apps(std::move(other._apps)),
+      _app(std::move(other._app)),
+      _app_launch_time(other._app_launch_time),
+      placebo(other.placebo),
+      _process(std::move(other._process)),
+      _process_group(std::move(other._process_group)),
+      _pipe(std::move(other._pipe)),
+      _app_prep_it(other._app_prep_it),
+      _app_prep_begin(other._app_prep_begin) {
+  }
+
+  proc_t &
+  proc_t::operator=(proc_t &&other) {
+    if (this == &other) {
+      return *this;
+    }
+
+    _app_id = other._app_id;
+    _app_pid.store(other._app_pid.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    _apps_etag = std::move(other._apps_etag);
+    _env = std::move(other._env);
+    _apps = std::move(other._apps);
+    _app = std::move(other._app);
+    _app_launch_time = other._app_launch_time;
+    placebo = other.placebo;
+    _process = std::move(other._process);
+    _process_group = std::move(other._process_group);
+    _pipe = std::move(other._pipe);
+    _app_prep_it = other._app_prep_it;
+    _app_prep_begin = other._app_prep_begin;
+    return *this;
+  }
+
   class deinit_t: public platf::deinit_t {
   public:
     ~deinit_t() {
@@ -339,6 +377,10 @@ namespace proc {
       }
     }
 
+    // Reset before launching so Desktop apps or a failed start never leave a
+    // stale PID around for the window-follow candidate filter.
+    _app_pid.store(0, std::memory_order_release);
+
     if (_app.cmd.empty()) {
       BOOST_LOG(info) << "Executing [Desktop]"sv;
       placebo = true;
@@ -359,6 +401,7 @@ namespace proc {
         return -1;
       }
       launch_splash::note_started(static_cast<std::uint32_t>(_process.id()), splash_launcher_reports);
+      _app_pid.store(static_cast<std::uint32_t>(_process.id()), std::memory_order_release);
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
@@ -600,6 +643,11 @@ namespace proc {
   std::string
   proc_t::get_last_run_app_name() {
     return _app.name;
+  }
+
+  std::uint32_t
+  proc_t::get_app_pid() {
+    return _app_pid.load(std::memory_order_acquire);
   }
 
   std::optional<rtsp_stream::synthetic_hdr_config_t>
